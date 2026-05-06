@@ -2,12 +2,21 @@ class CctvAppPanel extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
+
     this._hass = null;
-    this._renderSignature = null;
+    this._uiReady = false;
+    this._updateQueued = false;
+    this._updateHandle = null;
+    this._lastCameras = [];
+    this._cameraCards = new Map();
+    this._entityRows = new Map();
+    this._gridOrder = '';
+
     this._view = 'grid';
     this._detailMode = 'fullscreen';
     this._selectedCameraEntityId = null;
     this._motionPriority = true;
+
     this._autoCycleEnabled = false;
     this._autoCyclePaused = false;
     this._autoCycleScope = 'all';
@@ -15,69 +24,240 @@ class CctvAppPanel extends HTMLElement {
     this._autoCycleEntityId = null;
     this._autoCycleTimer = null;
     this._motionRefreshTimer = null;
-    this._escapeHandler = (event) => {
-      if (event.key === 'Escape') {
-        const fullscreen = this.shadowRoot.querySelector('.fullscreen');
-        if (fullscreen?.classList.contains('auto-cycle')) {
-          this._pauseAutoCycle();
-          return;
-        }
 
-        if (fullscreen) {
-          this._closeFullscreen();
-          return;
-        }
-
-        if (this._view === 'detail') {
-          this._backToGrid();
-        }
-      }
-    };
+    this._onKeyDown = (event) => this._handleKeyDown(event);
+    this._onClick = (event) => this._handleClick(event);
+    this._onInput = (event) => this._handleInput(event);
+    this._onShadowKeyDown = (event) => this._handleShadowKeyDown(event);
+    this._onAutoCyclePointer = (event) => this._handleAutoCycleInteraction(event);
   }
 
   set hass(hass) {
     this._hass = hass;
-    this._renderIfNeeded();
+    this._scheduleUpdate();
   }
 
   connectedCallback() {
-    document.addEventListener('keydown', this._escapeHandler);
+    this._ensureUi();
+    document.addEventListener('keydown', this._onKeyDown);
+    this.shadowRoot.addEventListener('click', this._onClick);
+    this.shadowRoot.addEventListener('input', this._onInput);
+    this.shadowRoot.addEventListener('keydown', this._onShadowKeyDown);
+    this._refs?.autoOverlay?.addEventListener('pointerdown', this._onAutoCyclePointer);
+
     if (!this._motionRefreshTimer) {
-      this._motionRefreshTimer = window.setInterval(() => this._renderIfNeeded(), 30000);
+      this._motionRefreshTimer = window.setInterval(() => this._scheduleUpdate(), 30000);
     }
-    this._renderIfNeeded(true);
+
+    this._scheduleUpdate(true);
   }
 
   disconnectedCallback() {
-    document.removeEventListener('keydown', this._escapeHandler);
+    document.removeEventListener('keydown', this._onKeyDown);
+    this.shadowRoot.removeEventListener('click', this._onClick);
+    this.shadowRoot.removeEventListener('input', this._onInput);
+    this.shadowRoot.removeEventListener('keydown', this._onShadowKeyDown);
+    this._refs?.autoOverlay?.removeEventListener('pointerdown', this._onAutoCyclePointer);
+
     if (this._motionRefreshTimer) {
       window.clearInterval(this._motionRefreshTimer);
       this._motionRefreshTimer = null;
     }
+
+    if (this._updateHandle) {
+      window.cancelAnimationFrame(this._updateHandle);
+      this._updateHandle = null;
+    }
+
     this._clearAutoCycleTimer();
   }
 
-  _renderIfNeeded(force = false) {
-    const cameras = this._getCameras();
-    const selectedEntities = this._selectedCameraEntityId ? this._getDeviceEntities(this._selectedCameraEntityId) : [];
-    const signature = [
-      this._view,
-      this._detailMode,
-      this._selectedCameraEntityId || '',
-      this._motionPriority,
-      this._autoCycleEnabled,
-      this._autoCyclePaused,
-      this._autoCycleScope,
-      this._autoCycleInterval,
-      this._autoCycleEntityId || '',
-      cameras.map((camera) => `${camera.entityId}:${camera.name}:${camera.status}:${camera.isOnline}:${camera.hasMotion}:${camera.motionSensorId}:${camera.motionLastChanged}`).join('|'),
-      selectedEntities.map((entity) => `${entity.entityId}:${entity.state.state}:${entity.name}`).join('|'),
-    ].join('::');
-
-    if (force || signature !== this._renderSignature) {
-      this._renderSignature = signature;
-      this._render(cameras);
+  _scheduleUpdate(force = false) {
+    if (!this.isConnected && !force) {
+      return;
     }
+
+    this._ensureUi();
+    if (this._updateQueued) {
+      return;
+    }
+
+    this._updateQueued = true;
+    this._updateHandle = window.requestAnimationFrame(() => {
+      this._updateQueued = false;
+      this._updateHandle = null;
+      this._update();
+    });
+  }
+
+  _update() {
+    const cameras = this._getCameras();
+    this._lastCameras = cameras;
+
+    const selectedStillExists = cameras.some((camera) => camera.entityId === this._selectedCameraEntityId);
+    if (this._view === 'detail' && !selectedStillExists) {
+      this._backToGrid(false);
+    }
+
+    this._updateGridPage(cameras);
+    this._updateDetailPage(cameras);
+    this._updateAutoCycleOverlay(cameras);
+  }
+
+  _ensureUi() {
+    if (this._uiReady) {
+      return;
+    }
+
+    this.shadowRoot.innerHTML = `
+      ${this._styles()}
+      <main class="shell grid-page" data-page="grid">
+        <header class="header">
+          <h1>CCTV Control Center</h1>
+          <div class="status camera-count">0 cameras detected</div>
+        </header>
+
+        <section class="toolbar" aria-label="Camera view controls">
+          <div class="toggle" role="group" aria-label="Camera display mode">
+            <button type="button" class="mode-button" data-mode="all" aria-pressed="false">All Cameras</button>
+            <button type="button" class="mode-button" data-mode="motion" aria-pressed="true">Motion Priority Mode</button>
+          </div>
+          <div class="motion-summary">0 recent motion events</div>
+        </section>
+
+        <section class="cycle-panel" aria-label="Auto-cycle mode">
+          <div class="cycle-status">
+            <div class="cycle-title">Auto-Cycle Mode · Ready</div>
+            <div class="cycle-meta">0 eligible · 0 online · 0 motion · No camera queued</div>
+          </div>
+          <div class="toggle" role="group" aria-label="Auto-cycle camera scope">
+            <button type="button" class="cycle-button cycle-scope" data-cycle-scope="all" aria-pressed="true">All Cameras</button>
+            <button type="button" class="cycle-button cycle-scope" data-cycle-scope="motion" aria-pressed="false">Motion Only</button>
+          </div>
+          <label class="cycle-range">
+            <span class="cycle-interval-label">8s</span>
+            <input class="cycle-interval" type="range" min="5" max="15" step="1" value="8" aria-label="Auto-cycle interval seconds">
+          </label>
+          <div class="fullscreen-actions cycle-actions">
+            <button type="button" class="cycle-button cycle-start">Start Cycle</button>
+            <button type="button" class="cycle-button cycle-pause" hidden>Pause</button>
+            <button type="button" class="cycle-button cycle-resume" hidden>Resume</button>
+            <button type="button" class="cycle-button cycle-stop" hidden>Stop</button>
+          </div>
+        </section>
+
+        <section class="grid scale-balanced" aria-label="Camera feeds"></section>
+        <section class="empty" hidden>No camera entities found in Home Assistant.</section>
+      </main>
+
+      <main class="shell detail-shell" data-page="detail" hidden>
+        <header class="detail-topbar">
+          <button class="back" type="button">Back to Grid</button>
+          <div class="detail-title">
+            <h2 class="detail-name"></h2>
+            <div class="meta detail-meta"></div>
+          </div>
+          <div class="detail-tabs" role="group" aria-label="Camera detail mode">
+            <button type="button" class="detail-mode" data-detail-mode="fullscreen" aria-pressed="true">Fullscreen View</button>
+            <button type="button" class="detail-mode" data-detail-mode="controls" aria-pressed="false">Device Controls</button>
+          </div>
+        </header>
+
+        <section class="dashboard-panel detail-feed" aria-label="Fullscreen camera view">
+          <span class="motion-badge detail-motion" hidden>Motion</span>
+          <img class="detail-image" alt="Fullscreen live camera feed">
+          <div class="feed-hud">
+            <div>
+              <div class="entity-name">Live tactical feed</div>
+              <div class="entity-id detail-feed-status"><span class="status-light"></span>Offline</div>
+            </div>
+            <button class="fullscreen-action" type="button">Open Immersive</button>
+          </div>
+        </section>
+
+        <section class="dashboard-panel control-panel" aria-label="Device control panel" hidden>
+          <div class="control-grid">
+            <section class="empty controls-empty" hidden>No sensor, binary_sensor, switch, or button entities share this camera device_id.</section>
+            <section class="entity-group" data-group="sensors" hidden><h3>Sensors</h3><div class="entity-list"></div></section>
+            <section class="entity-group" data-group="binarySensors" hidden><h3>Binary Sensors</h3><div class="entity-list"></div></section>
+            <section class="entity-group" data-group="switches" hidden><h3>Switches</h3><div class="entity-list"></div></section>
+            <section class="entity-group" data-group="buttons" hidden><h3>Buttons</h3><div class="entity-list"></div></section>
+          </div>
+        </section>
+      </main>
+
+      <section class="fullscreen auto-cycle" role="dialog" aria-modal="true" hidden>
+        <div class="fullscreen-bar">
+          <div>
+            <div class="fullscreen-title auto-title"></div>
+            <div class="fullscreen-subtitle auto-subtitle"></div>
+          </div>
+          <div class="fullscreen-actions auto-cycle-control">
+            <button class="close cycle-pause" type="button">Pause</button>
+            <button class="close cycle-resume" type="button" hidden>Resume</button>
+            <button class="close cycle-stop" type="button" aria-label="Stop auto-cycle mode">Stop</button>
+          </div>
+        </div>
+        <div class="fullscreen-frame">
+          <div class="pause-ribbon" hidden>Cycling Paused</div>
+          <img class="auto-image" alt="Auto-cycle live camera feed">
+        </div>
+      </section>
+
+      <section class="fullscreen immersive" role="dialog" aria-modal="true" hidden>
+        <div class="fullscreen-bar">
+          <div class="fullscreen-title immersive-title"></div>
+          <button class="close immersive-close" type="button" aria-label="Close fullscreen camera">Close</button>
+        </div>
+        <div class="fullscreen-frame">
+          <img class="immersive-image" alt="Immersive live camera feed">
+        </div>
+      </section>
+    `;
+
+    this._refs = {
+      gridPage: this.shadowRoot.querySelector('[data-page="grid"]'),
+      detailPage: this.shadowRoot.querySelector('[data-page="detail"]'),
+      cameraCount: this.shadowRoot.querySelector('.camera-count'),
+      motionSummary: this.shadowRoot.querySelector('.motion-summary'),
+      modeAll: this.shadowRoot.querySelector('.mode-button[data-mode="all"]'),
+      modeMotion: this.shadowRoot.querySelector('.mode-button[data-mode="motion"]'),
+      cyclePanel: this.shadowRoot.querySelector('.cycle-panel'),
+      cycleTitle: this.shadowRoot.querySelector('.cycle-title'),
+      cycleMeta: this.shadowRoot.querySelector('.cycle-meta'),
+      cycleScopeAll: this.shadowRoot.querySelector('.cycle-scope[data-cycle-scope="all"]'),
+      cycleScopeMotion: this.shadowRoot.querySelector('.cycle-scope[data-cycle-scope="motion"]'),
+      cycleInterval: this.shadowRoot.querySelector('.cycle-interval'),
+      cycleIntervalLabel: this.shadowRoot.querySelector('.cycle-interval-label'),
+      cycleStart: this.shadowRoot.querySelector('.cycle-start'),
+      cyclePause: this.shadowRoot.querySelector('.cycle-actions .cycle-pause'),
+      cycleResume: this.shadowRoot.querySelector('.cycle-actions .cycle-resume'),
+      cycleStop: this.shadowRoot.querySelector('.cycle-actions .cycle-stop'),
+      grid: this.shadowRoot.querySelector('.grid'),
+      gridEmpty: this.shadowRoot.querySelector('.grid-page > .empty'),
+      detailName: this.shadowRoot.querySelector('.detail-name'),
+      detailMeta: this.shadowRoot.querySelector('.detail-meta'),
+      detailFeed: this.shadowRoot.querySelector('.detail-feed'),
+      detailMotion: this.shadowRoot.querySelector('.detail-motion'),
+      detailImage: this.shadowRoot.querySelector('.detail-image'),
+      detailFeedStatus: this.shadowRoot.querySelector('.detail-feed-status'),
+      detailModeFullscreen: this.shadowRoot.querySelector('.detail-mode[data-detail-mode="fullscreen"]'),
+      detailModeControls: this.shadowRoot.querySelector('.detail-mode[data-detail-mode="controls"]'),
+      controlPanel: this.shadowRoot.querySelector('.control-panel'),
+      controlsEmpty: this.shadowRoot.querySelector('.controls-empty'),
+      autoOverlay: this.shadowRoot.querySelector('.auto-cycle'),
+      autoTitle: this.shadowRoot.querySelector('.auto-title'),
+      autoSubtitle: this.shadowRoot.querySelector('.auto-subtitle'),
+      autoImage: this.shadowRoot.querySelector('.auto-image'),
+      autoPause: this.shadowRoot.querySelector('.auto-cycle .cycle-pause'),
+      autoResume: this.shadowRoot.querySelector('.auto-cycle .cycle-resume'),
+      pauseRibbon: this.shadowRoot.querySelector('.pause-ribbon'),
+      immersive: this.shadowRoot.querySelector('.immersive'),
+      immersiveTitle: this.shadowRoot.querySelector('.immersive-title'),
+      immersiveImage: this.shadowRoot.querySelector('.immersive-image'),
+    };
+
+    this._uiReady = true;
   }
 
   _getCameras() {
@@ -117,6 +297,10 @@ class CctvAppPanel extends HTMLElement {
   }
 
   _getMotionSensors() {
+    if (!this._hass?.states) {
+      return [];
+    }
+
     const now = Date.now();
     const recentWindow = 2 * 60 * 1000;
 
@@ -165,7 +349,7 @@ class CctvAppPanel extends HTMLElement {
   }
 
   _getDeviceEntities(cameraEntityId) {
-    if (!this._hass || !this._hass.states) {
+    if (!this._hass?.states) {
       return [];
     }
 
@@ -211,6 +395,596 @@ class CctvAppPanel extends HTMLElement {
     );
   }
 
+  _updateGridPage(cameras) {
+    const inGrid = this._view === 'grid';
+    const motionCount = cameras.filter((camera) => camera.hasMotion).length;
+    this._refs.gridPage.hidden = !inGrid;
+    this._refs.cameraCount.textContent = `${cameras.length} camera${cameras.length === 1 ? '' : 's'} detected`;
+    this._refs.motionSummary.textContent = `${motionCount} recent motion event${motionCount === 1 ? '' : 's'}`;
+    this._refs.modeAll.setAttribute('aria-pressed', String(!this._motionPriority));
+    this._refs.modeMotion.setAttribute('aria-pressed', String(this._motionPriority));
+
+    this._updateAutoCycleControls(cameras);
+    this._updateCameraCards(cameras);
+  }
+
+  _updateCameraCards(cameras) {
+    this._refs.grid.hidden = !cameras.length;
+    this._refs.gridEmpty.hidden = Boolean(cameras.length);
+    this._refs.grid.className = `grid ${this._gridScaleClass(cameras.length)}`;
+
+    const seen = new Set();
+    const order = cameras.map((camera) => camera.entityId).join('|');
+
+    cameras.forEach((camera) => {
+      seen.add(camera.entityId);
+      const card = this._cameraCards.get(camera.entityId) || this._createCameraCard(camera.entityId);
+      this._updateCameraCard(card, camera);
+    });
+
+    this._cameraCards.forEach((card, entityId) => {
+      if (!seen.has(entityId)) {
+        card.root.remove();
+        this._cameraCards.delete(entityId);
+      }
+    });
+
+    if (order !== this._gridOrder) {
+      const fragment = document.createDocumentFragment();
+      cameras.forEach((camera) => fragment.appendChild(this._cameraCards.get(camera.entityId).root));
+      this._refs.grid.appendChild(fragment);
+      this._gridOrder = order;
+    }
+  }
+
+  _createCameraCard(entityId) {
+    const root = document.createElement('article');
+    root.className = 'card';
+    root.tabIndex = 0;
+    root.setAttribute('role', 'button');
+    root.dataset.entityId = entityId;
+    root.innerHTML = `
+      <div class="frame">
+        <span class="motion-badge" hidden>Motion</span>
+        <span class="status-pill">Online</span>
+        <img loading="lazy" decoding="async" alt="Live camera feed">
+      </div>
+      <div class="name">
+        <span class="name-meta"><span class="camera-name"></span><span class="status-light" aria-label="Online"></span></span>
+        <span class="motion-dot" aria-label="Recent motion detected" hidden></span>
+      </div>
+    `;
+
+    const card = {
+      root,
+      motionBadge: root.querySelector('.motion-badge'),
+      statusPill: root.querySelector('.status-pill'),
+      image: root.querySelector('img'),
+      name: root.querySelector('.camera-name'),
+      statusLight: root.querySelector('.status-light'),
+      motionDot: root.querySelector('.motion-dot'),
+      signature: '',
+    };
+    this._cameraCards.set(entityId, card);
+    return card;
+  }
+
+  _updateCameraCard(card, camera) {
+    const isActive = camera.entityId === this._selectedCameraEntityId || camera.entityId === this._autoCycleEntityId;
+    const statusText = camera.isOnline ? 'Online' : 'Offline';
+    const src = this._cameraUrl(camera.entityId);
+    const signature = [camera.name, camera.hasMotion, camera.isOnline, statusText, isActive, src].join('|');
+
+    if (card.signature === signature) {
+      return;
+    }
+
+    card.signature = signature;
+    card.root.className = `card${camera.hasMotion ? ' motion' : ''}${isActive ? ' active' : ''}`;
+    card.root.setAttribute('aria-label', `Open ${camera.name} detail dashboard`);
+    card.motionBadge.hidden = !camera.hasMotion;
+    card.motionDot.hidden = !camera.hasMotion;
+    card.statusPill.className = `status-pill${camera.isOnline ? '' : ' offline'}`;
+    card.statusPill.textContent = statusText;
+    card.statusLight.className = `status-light${camera.isOnline ? '' : ' offline'}`;
+    card.statusLight.setAttribute('aria-label', statusText);
+    card.name.textContent = camera.name;
+    card.image.alt = `${camera.name} live camera feed`;
+    if (card.image.getAttribute('src') !== src) {
+      card.image.setAttribute('src', src);
+    }
+  }
+
+  _updateDetailPage(cameras) {
+    const camera = cameras.find((item) => item.entityId === this._selectedCameraEntityId);
+    const showDetail = this._view === 'detail' && Boolean(camera);
+    this._refs.detailPage.hidden = !showDetail;
+    if (!showDetail) {
+      return;
+    }
+
+    this._refs.detailName.textContent = camera.name;
+    this._refs.detailMeta.textContent = `${camera.entityId} · ${camera.deviceId ? `Device ${camera.deviceId}` : 'No device_id exposed'}`;
+    this._refs.detailModeFullscreen.setAttribute('aria-pressed', String(this._detailMode === 'fullscreen'));
+    this._refs.detailModeControls.setAttribute('aria-pressed', String(this._detailMode === 'controls'));
+    this._refs.detailFeed.hidden = this._detailMode !== 'fullscreen';
+    this._refs.controlPanel.hidden = this._detailMode !== 'controls';
+
+    if (this._detailMode === 'fullscreen') {
+      this._updateDetailFeed(camera);
+    } else {
+      this._updateControlPanel(camera);
+    }
+  }
+
+  _updateDetailFeed(camera) {
+    const src = this._cameraUrl(camera.entityId);
+    this._refs.detailMotion.hidden = !camera.hasMotion;
+    this._refs.detailImage.alt = `${camera.name} fullscreen live camera feed`;
+    if (this._refs.detailImage.getAttribute('src') !== src) {
+      this._refs.detailImage.setAttribute('src', src);
+    }
+
+    this._refs.detailFeedStatus.innerHTML = '';
+    const light = document.createElement('span');
+    light.className = `status-light${camera.isOnline ? '' : ' offline'}`;
+    this._refs.detailFeedStatus.append(light, `${camera.isOnline ? 'Online' : 'Offline'} · ${camera.entityId}`);
+  }
+
+  _updateControlPanel(camera) {
+    const grouped = this._groupDeviceEntities(this._getDeviceEntities(camera.entityId));
+    const total = grouped.sensors.length + grouped.binarySensors.length + grouped.switches.length + grouped.buttons.length;
+    this._refs.controlsEmpty.hidden = Boolean(total);
+    this._updateEntityGroup('sensors', grouped.sensors);
+    this._updateEntityGroup('binarySensors', grouped.binarySensors);
+    this._updateEntityGroup('switches', grouped.switches);
+    this._updateEntityGroup('buttons', grouped.buttons);
+  }
+
+  _updateEntityGroup(groupName, entities) {
+    const group = this.shadowRoot.querySelector(`[data-group="${groupName}"]`);
+    const list = group.querySelector('.entity-list');
+    group.hidden = !entities.length;
+
+    const seen = new Set();
+    const fragment = document.createDocumentFragment();
+
+    entities.forEach((entity) => {
+      seen.add(entity.entityId);
+      const row = this._entityRows.get(entity.entityId) || this._createEntityRow(entity.entityId);
+      this._updateEntityRow(row, entity);
+      fragment.appendChild(row.root);
+    });
+
+    this._entityRows.forEach((row, entityId) => {
+      if (row.groupName === groupName && !seen.has(entityId)) {
+        row.root.remove();
+        this._entityRows.delete(entityId);
+      }
+    });
+
+    list.appendChild(fragment);
+  }
+
+  _createEntityRow(entityId) {
+    const root = document.createElement('article');
+    root.className = 'entity-row';
+    root.dataset.entityId = entityId;
+    root.innerHTML = `
+      <div>
+        <div class="entity-name"></div>
+        <div class="entity-id"></div>
+      </div>
+      <div class="entity-state"></div>
+      <button class="control-action" type="button"></button>
+    `;
+
+    const row = {
+      root,
+      name: root.querySelector('.entity-name'),
+      id: root.querySelector('.entity-id'),
+      state: root.querySelector('.entity-state'),
+      action: root.querySelector('.control-action'),
+      signature: '',
+      groupName: '',
+    };
+    this._entityRows.set(entityId, row);
+    return row;
+  }
+
+  _updateEntityRow(row, entity) {
+    const canControl = entity.domain === 'switch' || entity.domain === 'button';
+    const action = entity.domain === 'switch' ? (entity.state.state === 'on' ? 'turn_off' : 'turn_on') : 'press';
+    const actionLabel = entity.domain === 'switch' ? (entity.state.state === 'on' ? 'Turn Off' : 'Turn On') : 'Press';
+    const stateClass = this._normalizeText(entity.state.state) === 'on' ? ' on' : '';
+    const groupName = entity.domain === 'binary_sensor' ? 'binarySensors' : `${entity.domain}s`;
+    const signature = [entity.name, entity.entityId, entity.state.state, canControl, action, actionLabel, groupName].join('|');
+
+    if (row.signature === signature) {
+      return;
+    }
+
+    row.signature = signature;
+    row.groupName = groupName;
+    row.name.textContent = entity.name;
+    row.id.textContent = entity.entityId;
+    row.state.className = `entity-state${stateClass}`;
+    row.state.textContent = entity.state.state;
+    row.action.hidden = !canControl;
+    row.action.dataset.entityId = entity.entityId;
+    row.action.dataset.action = action;
+    row.action.textContent = actionLabel;
+  }
+
+  _updateAutoCycleControls(cameras) {
+    const onlineCount = cameras.filter((camera) => camera.isOnline).length;
+    const eligibleCount = this._getCycleCameras(cameras).length;
+    const motionEligibleCount = cameras.filter((camera) => camera.isOnline && camera.hasMotion).length;
+    const stateText = this._autoCycleEnabled ? (this._autoCyclePaused ? 'Paused' : 'Cycling') : 'Ready';
+    const currentCamera = this._currentCycleCamera(cameras);
+
+    this._refs.cycleTitle.textContent = `Auto-Cycle Mode · ${stateText}`;
+    this._refs.cycleMeta.textContent = `${eligibleCount} eligible · ${onlineCount} online · ${motionEligibleCount} motion · ${currentCamera ? currentCamera.name : 'No camera queued'}`;
+    this._refs.cycleScopeAll.setAttribute('aria-pressed', String(this._autoCycleScope === 'all'));
+    this._refs.cycleScopeMotion.setAttribute('aria-pressed', String(this._autoCycleScope === 'motion'));
+    this._refs.cycleInterval.value = String(this._autoCycleInterval);
+    this._refs.cycleIntervalLabel.textContent = `${this._autoCycleInterval}s`;
+    this._refs.cycleStart.hidden = this._autoCycleEnabled;
+    this._refs.cyclePause.hidden = !this._autoCycleEnabled || this._autoCyclePaused;
+    this._refs.cycleResume.hidden = !this._autoCycleEnabled || !this._autoCyclePaused;
+    this._refs.cycleStop.hidden = !this._autoCycleEnabled;
+  }
+
+  _updateAutoCycleOverlay(cameras) {
+    if (!this._autoCycleEnabled) {
+      this._refs.autoOverlay.hidden = true;
+      return;
+    }
+
+    const camera = this._currentCycleCamera(cameras);
+    if (!camera) {
+      this._autoCyclePaused = true;
+      this._clearAutoCycleTimer();
+      this._refs.autoOverlay.hidden = true;
+      return;
+    }
+
+    this._autoCycleEntityId = camera.entityId;
+    this._refs.autoOverlay.hidden = false;
+    this._refs.autoOverlay.className = `fullscreen auto-cycle${this._autoCyclePaused ? ' auto-cycle-paused' : ''}`;
+    this._refs.autoTitle.textContent = `Auto-Cycle · ${camera.name}`;
+    this._refs.autoSubtitle.textContent = `${this._autoCyclePaused ? 'Paused by interaction' : `Next camera in ${this._autoCycleInterval}s`} · ${this._autoCycleScope === 'motion' ? 'Motion-only cameras' : 'All online cameras'}`;
+    this._refs.autoPause.hidden = this._autoCyclePaused;
+    this._refs.autoResume.hidden = !this._autoCyclePaused;
+    this._refs.pauseRibbon.hidden = !this._autoCyclePaused;
+    this._refs.autoImage.alt = `${camera.name} auto-cycle live camera feed`;
+    const src = this._cameraUrl(camera.entityId);
+    if (this._refs.autoImage.getAttribute('src') !== src) {
+      this._refs.autoImage.setAttribute('src', src);
+    }
+  }
+
+  _gridScaleClass(count) {
+    if (count <= 4) {
+      return 'scale-few';
+    }
+
+    if (count >= 10) {
+      return 'scale-wall';
+    }
+
+    return 'scale-balanced';
+  }
+
+  _openCameraDetail(entityId, mode = 'fullscreen') {
+    if (!this._lastCameras.some((camera) => camera.entityId === entityId)) {
+      return;
+    }
+
+    this._selectedCameraEntityId = entityId;
+    this._detailMode = mode;
+    this._view = 'detail';
+    this._scheduleUpdate(true);
+  }
+
+  _backToGrid(schedule = true) {
+    this._view = 'grid';
+    this._detailMode = 'fullscreen';
+    this._selectedCameraEntityId = null;
+    this._closeFullscreenElementOnly();
+    if (schedule) {
+      this._scheduleUpdate(true);
+    }
+  }
+
+  _openFullscreen(entityId = this._selectedCameraEntityId) {
+    const camera = this._lastCameras.find((item) => item.entityId === entityId) || this._getCameras().find((item) => item.entityId === entityId);
+    if (!camera) {
+      return;
+    }
+
+    this._refs.immersive.hidden = false;
+    this._refs.immersiveTitle.textContent = camera.name;
+    this._refs.immersiveImage.alt = `${camera.name} immersive live camera feed`;
+    const src = this._cameraUrl(camera.entityId);
+    if (this._refs.immersiveImage.getAttribute('src') !== src) {
+      this._refs.immersiveImage.setAttribute('src', src);
+    }
+    this.shadowRoot.querySelector('.immersive-close').focus();
+  }
+
+  _closeFullscreen() {
+    this._closeFullscreenElementOnly();
+  }
+
+  _closeFullscreenElementOnly() {
+    this._refs.immersive.hidden = true;
+  }
+
+  _startAutoCycle() {
+    const camera = this._currentCycleCamera();
+    if (!camera) {
+      return;
+    }
+
+    this._autoCycleEnabled = true;
+    this._autoCyclePaused = false;
+    this._autoCycleEntityId = camera.entityId;
+    this._scheduleUpdate(true);
+    this._scheduleAutoCycle();
+  }
+
+  _resumeAutoCycle() {
+    if (!this._autoCycleEnabled) {
+      this._startAutoCycle();
+      return;
+    }
+
+    const camera = this._currentCycleCamera();
+    if (!camera) {
+      this._stopAutoCycle();
+      return;
+    }
+
+    this._autoCyclePaused = false;
+    this._autoCycleEntityId = camera.entityId;
+    this._scheduleUpdate(true);
+    this._scheduleAutoCycle();
+  }
+
+  _pauseAutoCycle() {
+    if (!this._autoCycleEnabled || this._autoCyclePaused) {
+      return;
+    }
+
+    this._autoCyclePaused = true;
+    this._clearAutoCycleTimer();
+    this._scheduleUpdate(true);
+  }
+
+  _stopAutoCycle() {
+    this._autoCycleEnabled = false;
+    this._autoCyclePaused = false;
+    this._autoCycleEntityId = null;
+    this._clearAutoCycleTimer();
+    this._scheduleUpdate(true);
+  }
+
+  _advanceAutoCycle() {
+    if (!this._autoCycleEnabled || this._autoCyclePaused) {
+      return;
+    }
+
+    const cameras = this._getCycleCameras();
+    if (!cameras.length) {
+      this._stopAutoCycle();
+      return;
+    }
+
+    const currentIndex = Math.max(0, cameras.findIndex((camera) => camera.entityId === this._autoCycleEntityId));
+    this._autoCycleEntityId = cameras[(currentIndex + 1) % cameras.length].entityId;
+    this._scheduleUpdate(true);
+    this._scheduleAutoCycle();
+  }
+
+  _scheduleAutoCycle() {
+    this._clearAutoCycleTimer();
+    if (!this._autoCycleEnabled || this._autoCyclePaused) {
+      return;
+    }
+
+    this._autoCycleTimer = window.setTimeout(() => this._advanceAutoCycle(), this._autoCycleInterval * 1000);
+  }
+
+  _clearAutoCycleTimer() {
+    if (this._autoCycleTimer) {
+      window.clearTimeout(this._autoCycleTimer);
+      this._autoCycleTimer = null;
+    }
+  }
+
+  _setMotionPriority(enabled) {
+    if (this._motionPriority === enabled) {
+      return;
+    }
+
+    this._motionPriority = enabled;
+    this._scheduleUpdate(true);
+  }
+
+  _setDetailMode(mode) {
+    if (this._detailMode === mode) {
+      return;
+    }
+
+    this._detailMode = mode;
+    this._scheduleUpdate(true);
+  }
+
+  _setAutoCycleInterval(value) {
+    const nextInterval = Math.min(15, Math.max(5, Number(value) || 8));
+    if (this._autoCycleInterval === nextInterval) {
+      return;
+    }
+
+    this._autoCycleInterval = nextInterval;
+    this._scheduleUpdate(true);
+    this._scheduleAutoCycle();
+  }
+
+  _setAutoCycleScope(scope) {
+    if (!['all', 'motion'].includes(scope) || this._autoCycleScope === scope) {
+      return;
+    }
+
+    this._autoCycleScope = scope;
+    const camera = this._currentCycleCamera();
+    this._autoCycleEntityId = camera?.entityId || null;
+    if (this._autoCycleEnabled && !camera) {
+      this._autoCyclePaused = true;
+      this._clearAutoCycleTimer();
+    }
+
+    this._scheduleUpdate(true);
+    this._scheduleAutoCycle();
+  }
+
+  _getCycleCameras(cameras = this._getCameras()) {
+    return cameras.filter((camera) => camera.isOnline && (this._autoCycleScope === 'all' || camera.hasMotion));
+  }
+
+  _currentCycleCamera(cameras = this._getCameras()) {
+    const cycleCameras = this._getCycleCameras(cameras);
+    return cycleCameras.find((camera) => camera.entityId === this._autoCycleEntityId) || cycleCameras[0] || null;
+  }
+
+  _handleKeyDown(event) {
+    if (event.key !== 'Escape') {
+      return;
+    }
+
+    if (!this._refs?.autoOverlay.hidden) {
+      this._pauseAutoCycle();
+      return;
+    }
+
+    if (!this._refs?.immersive.hidden) {
+      this._closeFullscreen();
+      return;
+    }
+
+    if (this._view === 'detail') {
+      this._backToGrid();
+    }
+  }
+
+  _handleShadowKeyDown(event) {
+    const card = event.target.closest('.card');
+    if (card && (event.key === 'Enter' || event.key === ' ')) {
+      event.preventDefault();
+      this._openCameraDetail(card.dataset.entityId);
+    }
+  }
+
+  _handleClick(event) {
+    const card = event.target.closest('.card');
+    if (card) {
+      this._openCameraDetail(card.dataset.entityId);
+      return;
+    }
+
+    if (event.target.closest('.back')) {
+      this._backToGrid();
+      return;
+    }
+
+    const modeButton = event.target.closest('.mode-button');
+    if (modeButton) {
+      this._setMotionPriority(modeButton.dataset.mode === 'motion');
+      return;
+    }
+
+    const detailButton = event.target.closest('.detail-mode');
+    if (detailButton) {
+      this._setDetailMode(detailButton.dataset.detailMode);
+      return;
+    }
+
+    const cycleScope = event.target.closest('.cycle-scope');
+    if (cycleScope) {
+      this._setAutoCycleScope(cycleScope.dataset.cycleScope);
+      return;
+    }
+
+    if (event.target.closest('.cycle-start')) {
+      this._startAutoCycle();
+      return;
+    }
+
+    if (event.target.closest('.cycle-pause')) {
+      this._pauseAutoCycle();
+      return;
+    }
+
+    if (event.target.closest('.cycle-resume')) {
+      this._resumeAutoCycle();
+      return;
+    }
+
+    if (event.target.closest('.cycle-stop')) {
+      this._stopAutoCycle();
+      return;
+    }
+
+    if (event.target.closest('.fullscreen-action')) {
+      this._openFullscreen(this._selectedCameraEntityId);
+      return;
+    }
+
+    if (event.target.closest('.immersive-close')) {
+      this._closeFullscreen();
+      return;
+    }
+
+    const action = event.target.closest('.control-action');
+    if (action) {
+      this._callEntityService(action.dataset.entityId, action.dataset.action);
+    }
+  }
+
+  _handleInput(event) {
+    if (event.target.matches('.cycle-interval')) {
+      this._setAutoCycleInterval(event.target.value);
+    }
+  }
+
+  _handleAutoCycleInteraction(event) {
+    if (event.target.closest('.auto-cycle-control')) {
+      return;
+    }
+
+    this._pauseAutoCycle();
+  }
+
+  _callEntityService(entityId, action) {
+    if (!this._hass?.callService) {
+      return;
+    }
+
+    const domain = this._domain(entityId);
+    if (domain === 'switch') {
+      this._hass.callService('switch', action, { entity_id: entityId });
+    }
+
+    if (domain === 'button') {
+      this._hass.callService('button', 'press', { entity_id: entityId });
+    }
+  }
+
+  _isOnlineCameraState(state) {
+    return Boolean(state) && !['unavailable', 'unknown'].includes(String(state.state).toLowerCase());
+  }
+
   _similarDeviceId(left, right) {
     return left === right || left.includes(right) || right.includes(left);
   }
@@ -234,217 +1008,6 @@ class CctvAppPanel extends HTMLElement {
 
   _cameraUrl(entityId) {
     return `/api/camera_proxy/${encodeURIComponent(entityId)}`;
-  }
-
-  _isOnlineCameraState(state) {
-    return Boolean(state) && !['unavailable', 'unknown'].includes(String(state.state).toLowerCase());
-  }
-
-  _getCycleCameras(cameras = this._getCameras()) {
-    return cameras.filter((camera) => camera.isOnline && (this._autoCycleScope === 'all' || camera.hasMotion));
-  }
-
-  _currentCycleCamera(cameras = this._getCameras()) {
-    const cycleCameras = this._getCycleCameras(cameras);
-    return cycleCameras.find((camera) => camera.entityId === this._autoCycleEntityId) || cycleCameras[0] || null;
-  }
-
-  _startAutoCycle() {
-    const camera = this._currentCycleCamera();
-    if (!camera) {
-      return;
-    }
-
-    this._autoCycleEnabled = true;
-    this._autoCyclePaused = false;
-    this._autoCycleEntityId = camera.entityId;
-    this._renderIfNeeded(true);
-    this._scheduleAutoCycle();
-  }
-
-  _resumeAutoCycle() {
-    if (!this._autoCycleEnabled) {
-      this._startAutoCycle();
-      return;
-    }
-
-    const camera = this._currentCycleCamera();
-    if (!camera) {
-      this._stopAutoCycle();
-      return;
-    }
-
-    this._autoCyclePaused = false;
-    this._autoCycleEntityId = camera.entityId;
-    this._renderIfNeeded(true);
-    this._scheduleAutoCycle();
-  }
-
-  _pauseAutoCycle() {
-    if (!this._autoCycleEnabled || this._autoCyclePaused) {
-      return;
-    }
-
-    this._autoCyclePaused = true;
-    this._clearAutoCycleTimer();
-    this._renderIfNeeded(true);
-  }
-
-  _stopAutoCycle() {
-    this._autoCycleEnabled = false;
-    this._autoCyclePaused = false;
-    this._autoCycleEntityId = null;
-    this._clearAutoCycleTimer();
-    this._closeFullscreenElementOnly();
-    this._renderIfNeeded(true);
-  }
-
-  _advanceAutoCycle() {
-    if (!this._autoCycleEnabled || this._autoCyclePaused) {
-      return;
-    }
-
-    const cameras = this._getCycleCameras();
-    if (!cameras.length) {
-      this._stopAutoCycle();
-      return;
-    }
-
-    const currentIndex = Math.max(0, cameras.findIndex((camera) => camera.entityId === this._autoCycleEntityId));
-    this._autoCycleEntityId = cameras[(currentIndex + 1) % cameras.length].entityId;
-    this._renderIfNeeded(true);
-    this._scheduleAutoCycle();
-  }
-
-  _scheduleAutoCycle() {
-    this._clearAutoCycleTimer();
-    if (!this._autoCycleEnabled || this._autoCyclePaused) {
-      return;
-    }
-
-    this._autoCycleTimer = window.setTimeout(() => this._advanceAutoCycle(), this._autoCycleInterval * 1000);
-  }
-
-  _clearAutoCycleTimer() {
-    if (this._autoCycleTimer) {
-      window.clearTimeout(this._autoCycleTimer);
-      this._autoCycleTimer = null;
-    }
-  }
-
-  _setAutoCycleInterval(value) {
-    const nextInterval = Math.min(15, Math.max(5, Number(value) || 8));
-    if (this._autoCycleInterval === nextInterval) {
-      return;
-    }
-
-    this._autoCycleInterval = nextInterval;
-    this._renderIfNeeded(true);
-    this._scheduleAutoCycle();
-  }
-
-  _setAutoCycleScope(scope) {
-    if (!['all', 'motion'].includes(scope) || this._autoCycleScope === scope) {
-      return;
-    }
-
-    this._autoCycleScope = scope;
-    const camera = this._currentCycleCamera();
-    this._autoCycleEntityId = camera?.entityId || null;
-    if (this._autoCycleEnabled && !camera) {
-      this._autoCyclePaused = true;
-      this._clearAutoCycleTimer();
-    }
-
-    this._renderIfNeeded(true);
-    this._scheduleAutoCycle();
-  }
-
-  _handleAutoCycleInteraction(event) {
-    if (event.target.closest('.auto-cycle-control')) {
-      return;
-    }
-
-    this._pauseAutoCycle();
-  }
-
-  _openCameraDetail(entityId, mode = 'fullscreen') {
-    const camera = this._getCameras().find((item) => item.entityId === entityId);
-    if (!camera) {
-      return;
-    }
-
-    this._selectedCameraEntityId = entityId;
-    this._detailMode = mode;
-    this._view = 'detail';
-    this._renderIfNeeded(true);
-  }
-
-  _backToGrid() {
-    this._view = 'grid';
-    this._detailMode = 'fullscreen';
-    this._selectedCameraEntityId = null;
-    this._closeFullscreenElementOnly();
-    this._renderIfNeeded(true);
-  }
-
-  _openFullscreen(entityId = this._selectedCameraEntityId) {
-    const camera = this._getCameras().find((item) => item.entityId === entityId);
-    if (!camera) {
-      return;
-    }
-
-    this._renderFullscreen(camera);
-  }
-
-  _closeFullscreen() {
-    this._closeFullscreenElementOnly();
-  }
-
-  _setMotionPriority(enabled) {
-    if (this._motionPriority === enabled) {
-      return;
-    }
-
-    this._motionPriority = enabled;
-    this._renderIfNeeded(true);
-  }
-
-  _setDetailMode(mode) {
-    if (this._detailMode === mode) {
-      return;
-    }
-
-    this._detailMode = mode;
-    this._renderIfNeeded(true);
-  }
-
-  _callEntityService(entityId, action) {
-    if (!this._hass || !this._hass.callService) {
-      return;
-    }
-
-    const domain = this._domain(entityId);
-    if (domain === 'switch') {
-      this._hass.callService('switch', action, { entity_id: entityId });
-    }
-
-    if (domain === 'button') {
-      this._hass.callService('button', 'press', { entity_id: entityId });
-    }
-  }
-
-  _render(cameras) {
-    const selectedCamera = cameras.find((camera) => camera.entityId === this._selectedCameraEntityId);
-
-    if (this._view === 'detail' && selectedCamera) {
-      this._renderDetail(cameras, selectedCamera);
-    } else {
-      this._view = 'grid';
-      this._renderGridPage(cameras);
-    }
-
-    this._renderAutoCycleOverlay(cameras);
   }
 
   _styles() {
@@ -481,6 +1044,10 @@ class CctvAppPanel extends HTMLElement {
 
         button {
           font: inherit;
+        }
+
+        [hidden] {
+          display: none !important;
         }
 
         .shell {
@@ -824,7 +1391,7 @@ class CctvAppPanel extends HTMLElement {
           position: absolute;
           top: 0.75rem;
           left: 0.75rem;
-          z-index: 1;
+          z-index: 2;
           display: inline-flex;
           align-items: center;
           gap: 0.35rem;
@@ -942,7 +1509,9 @@ class CctvAppPanel extends HTMLElement {
         }
 
         .status-light {
+          display: inline-block;
           flex: 0 0 auto;
+          vertical-align: middle;
         }
 
         .empty {
@@ -996,7 +1565,7 @@ class CctvAppPanel extends HTMLElement {
         .feed-hud {
           position: absolute;
           inset: auto 1rem 1rem 1rem;
-          z-index: 1;
+          z-index: 2;
           display: flex;
           align-items: center;
           justify-content: space-between;
@@ -1135,6 +1704,7 @@ class CctvAppPanel extends HTMLElement {
         }
 
         .fullscreen-frame {
+          position: relative;
           display: grid;
           min-height: 0;
           place-items: center;
@@ -1188,302 +1758,6 @@ class CctvAppPanel extends HTMLElement {
         }
       </style>
     `;
-  }
-
-  _gridScaleClass(count) {
-    if (count <= 4) {
-      return 'scale-few';
-    }
-
-    if (count >= 10) {
-      return 'scale-wall';
-    }
-
-    return 'scale-balanced';
-  }
-
-  _renderAutoCycleControls(cameras) {
-    const onlineCount = cameras.filter((camera) => camera.isOnline).length;
-    const eligibleCount = this._getCycleCameras(cameras).length;
-    const motionEligibleCount = cameras.filter((camera) => camera.isOnline && camera.hasMotion).length;
-    const stateText = this._autoCycleEnabled ? (this._autoCyclePaused ? 'Paused' : 'Cycling') : 'Ready';
-    const currentCamera = this._currentCycleCamera(cameras);
-
-    return `
-      <section class="cycle-panel" aria-label="Auto-cycle mode">
-        <div class="cycle-status">
-          <div class="cycle-title">Auto-Cycle Mode · ${stateText}</div>
-          <div class="cycle-meta">${eligibleCount} eligible · ${onlineCount} online · ${motionEligibleCount} motion · ${currentCamera ? this._escapeText(currentCamera.name) : 'No camera queued'}</div>
-        </div>
-        <div class="toggle" role="group" aria-label="Auto-cycle camera scope">
-          <button type="button" class="cycle-button cycle-scope" data-cycle-scope="all" aria-pressed="${this._autoCycleScope === 'all'}">All Cameras</button>
-          <button type="button" class="cycle-button cycle-scope" data-cycle-scope="motion" aria-pressed="${this._autoCycleScope === 'motion'}">Motion Only</button>
-        </div>
-        <label class="cycle-range">
-          <span>${this._autoCycleInterval}s</span>
-          <input class="cycle-interval" type="range" min="5" max="15" step="1" value="${this._autoCycleInterval}" aria-label="Auto-cycle interval seconds">
-        </label>
-        <div class="fullscreen-actions">
-          ${!this._autoCycleEnabled ? '<button type="button" class="cycle-button cycle-start">Start Cycle</button>' : ''}
-          ${this._autoCycleEnabled && !this._autoCyclePaused ? '<button type="button" class="cycle-button cycle-pause">Pause</button>' : ''}
-          ${this._autoCycleEnabled && this._autoCyclePaused ? '<button type="button" class="cycle-button cycle-resume">Resume</button>' : ''}
-          ${this._autoCycleEnabled ? '<button type="button" class="cycle-button cycle-stop">Stop</button>' : ''}
-        </div>
-      </section>
-    `;
-  }
-
-  _renderAutoCycleOverlay(cameras) {
-    if (!this._autoCycleEnabled) {
-      return;
-    }
-
-    const camera = this._currentCycleCamera(cameras);
-    if (!camera) {
-      this._autoCyclePaused = true;
-      this._clearAutoCycleTimer();
-      return;
-    }
-
-    this._autoCycleEntityId = camera.entityId;
-    this._closeFullscreenElementOnly();
-
-    const overlay = document.createElement('section');
-    overlay.className = `fullscreen auto-cycle${this._autoCyclePaused ? ' auto-cycle-paused' : ''}`;
-    overlay.setAttribute('role', 'dialog');
-    overlay.setAttribute('aria-modal', 'true');
-    overlay.innerHTML = `
-      <div class="fullscreen-bar">
-        <div>
-          <div class="fullscreen-title">Auto-Cycle · ${this._escapeText(camera.name)}</div>
-          <div class="fullscreen-subtitle">${this._autoCyclePaused ? 'Paused by interaction' : `Next camera in ${this._autoCycleInterval}s`} · ${this._autoCycleScope === 'motion' ? 'Motion-only cameras' : 'All online cameras'}</div>
-        </div>
-        <div class="fullscreen-actions auto-cycle-control">
-          ${this._autoCyclePaused ? '<button class="close cycle-resume" type="button">Resume</button>' : '<button class="close cycle-pause" type="button">Pause</button>'}
-          <button class="close cycle-stop" type="button" aria-label="Stop auto-cycle mode">Stop</button>
-        </div>
-      </div>
-      <div class="fullscreen-frame">
-        ${this._autoCyclePaused ? '<div class="pause-ribbon">Cycling Paused</div>' : ''}
-        <img src="${this._cameraUrl(camera.entityId)}" alt="${this._escapeText(camera.name)} auto-cycle live camera feed">
-      </div>
-    `;
-
-    overlay.addEventListener('pointerdown', (event) => this._handleAutoCycleInteraction(event));
-    overlay.addEventListener('keydown', (event) => this._handleAutoCycleInteraction(event));
-    overlay.querySelector('.cycle-pause')?.addEventListener('click', () => this._pauseAutoCycle());
-    overlay.querySelector('.cycle-resume')?.addEventListener('click', () => this._resumeAutoCycle());
-    overlay.querySelector('.cycle-stop')?.addEventListener('click', () => this._stopAutoCycle());
-    this.shadowRoot.appendChild(overlay);
-  }
-
-  _renderGridPage(cameras) {
-    const motionCount = cameras.filter((camera) => camera.hasMotion).length;
-
-    this.shadowRoot.innerHTML = `
-      ${this._styles()}
-      <main class="shell">
-        <header class="header">
-          <h1>CCTV Control Center</h1>
-          <div class="status">${cameras.length} camera${cameras.length === 1 ? '' : 's'} detected</div>
-        </header>
-
-        <section class="toolbar" aria-label="Camera view controls">
-          <div class="toggle" role="group" aria-label="Camera display mode">
-            <button type="button" class="mode-button" data-mode="all" aria-pressed="${!this._motionPriority}">All Cameras</button>
-            <button type="button" class="mode-button" data-mode="motion" aria-pressed="${this._motionPriority}">Motion Priority Mode</button>
-          </div>
-          <div class="motion-summary">${motionCount} recent motion event${motionCount === 1 ? '' : 's'}</div>
-        </section>
-
-        ${this._renderAutoCycleControls(cameras)}
-
-        ${cameras.length ? this._renderCameraGrid(cameras) : this._renderEmpty()}
-      </main>
-    `;
-
-    this.shadowRoot.querySelectorAll('.mode-button').forEach((button) => {
-      button.addEventListener('click', () => this._setMotionPriority(button.dataset.mode === 'motion'));
-    });
-
-    this.shadowRoot.querySelectorAll('.cycle-scope').forEach((button) => {
-      button.addEventListener('click', () => this._setAutoCycleScope(button.dataset.cycleScope));
-    });
-    this.shadowRoot.querySelector('.cycle-start')?.addEventListener('click', () => this._startAutoCycle());
-    this.shadowRoot.querySelector('.cycle-resume')?.addEventListener('click', () => this._resumeAutoCycle());
-    this.shadowRoot.querySelector('.cycle-pause')?.addEventListener('click', () => this._pauseAutoCycle());
-    this.shadowRoot.querySelector('.cycle-stop')?.addEventListener('click', () => this._stopAutoCycle());
-    this.shadowRoot.querySelector('.cycle-interval')?.addEventListener('input', (event) => this._setAutoCycleInterval(event.target.value));
-
-    this.shadowRoot.querySelectorAll('.card').forEach((card) => {
-      card.addEventListener('click', () => this._openCameraDetail(card.dataset.entityId));
-      card.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          this._openCameraDetail(card.dataset.entityId);
-        }
-      });
-    });
-  }
-
-  _renderCameraGrid(cameras) {
-    return `
-      <section class="grid ${this._gridScaleClass(cameras.length)}" aria-label="Camera feeds">
-        ${cameras
-          .map(
-            (camera) => {
-              const isActive = camera.entityId === this._selectedCameraEntityId || camera.entityId === this._autoCycleEntityId;
-              const statusText = camera.isOnline ? 'Online' : 'Offline';
-
-              return `
-                <article class="card${camera.hasMotion ? ' motion' : ''}${isActive ? ' active' : ''}" tabindex="0" role="button" aria-label="Open ${this._escapeText(camera.name)} detail dashboard" data-entity-id="${this._escapeText(camera.entityId)}">
-                  <div class="frame">
-                    ${camera.hasMotion ? '<span class="motion-badge">Motion</span>' : ''}
-                    <span class="status-pill${camera.isOnline ? '' : ' offline'}">${statusText}</span>
-                    <img loading="lazy" decoding="async" src="${this._cameraUrl(camera.entityId)}" alt="${this._escapeText(camera.name)} live camera feed">
-                  </div>
-                  <div class="name">
-                    <span class="name-meta"><span>${this._escapeText(camera.name)}</span><span class="status-light${camera.isOnline ? '' : ' offline'}" aria-label="${statusText}"></span></span>
-                    ${camera.hasMotion ? '<span class="motion-dot" aria-label="Recent motion detected"></span>' : ''}
-                  </div>
-                </article>
-              `;
-            },
-          )
-          .join('')}
-      </section>
-    `;
-  }
-
-  _renderDetail(cameras, camera) {
-    const deviceEntities = this._getDeviceEntities(camera.entityId);
-    const grouped = this._groupDeviceEntities(deviceEntities);
-
-    this.shadowRoot.innerHTML = `
-      ${this._styles()}
-      <main class="shell detail-shell">
-        <header class="detail-topbar">
-          <button class="back" type="button">Back to Grid</button>
-          <div class="detail-title">
-            <h2>${this._escapeText(camera.name)}</h2>
-            <div class="meta">${this._escapeText(camera.entityId)} · ${camera.deviceId ? `Device ${this._escapeText(camera.deviceId)}` : 'No device_id exposed'}</div>
-          </div>
-          <div class="detail-tabs" role="group" aria-label="Camera detail mode">
-            <button type="button" class="detail-mode" data-detail-mode="fullscreen" aria-pressed="${this._detailMode === 'fullscreen'}">Fullscreen View</button>
-            <button type="button" class="detail-mode" data-detail-mode="controls" aria-pressed="${this._detailMode === 'controls'}">Device Controls</button>
-          </div>
-        </header>
-
-        ${this._detailMode === 'controls' ? this._renderControlPanel(grouped, camera) : this._renderDetailFeed(camera)}
-      </main>
-    `;
-
-    this.shadowRoot.querySelector('.back')?.addEventListener('click', () => this._backToGrid());
-    this.shadowRoot.querySelectorAll('.detail-mode').forEach((button) => {
-      button.addEventListener('click', () => this._setDetailMode(button.dataset.detailMode));
-    });
-    this.shadowRoot.querySelector('.fullscreen-action')?.addEventListener('click', () => this._openFullscreen(camera.entityId));
-    this.shadowRoot.querySelectorAll('.control-action').forEach((button) => {
-      button.addEventListener('click', () => this._callEntityService(button.dataset.entityId, button.dataset.action));
-    });
-  }
-
-  _renderDetailFeed(camera) {
-    return `
-      <section class="dashboard-panel detail-feed" aria-label="Fullscreen camera view">
-        ${camera.hasMotion ? '<span class="motion-badge">Motion</span>' : ''}
-        <img src="${this._cameraUrl(camera.entityId)}" alt="${this._escapeText(camera.name)} fullscreen live camera feed">
-        <div class="feed-hud">
-          <div>
-            <div class="entity-name">Live tactical feed</div>
-            <div class="entity-id"><span class="status-light${camera.isOnline ? '' : ' offline'}"></span>${camera.isOnline ? 'Online' : 'Offline'} · ${this._escapeText(camera.entityId)}</div>
-          </div>
-          <button class="fullscreen-action" type="button">Open Immersive</button>
-        </div>
-      </section>
-    `;
-  }
-
-  _renderControlPanel(grouped, camera) {
-    const total = grouped.sensors.length + grouped.binarySensors.length + grouped.switches.length + grouped.buttons.length;
-
-    return `
-      <section class="dashboard-panel" aria-label="Device control panel">
-        <div class="control-grid">
-          ${total ? '' : `<section class="empty">No sensor, binary_sensor, switch, or button entities share the device_id for ${this._escapeText(camera.name)}.</section>`}
-          ${this._renderEntityGroup('Sensors', grouped.sensors)}
-          ${this._renderEntityGroup('Binary Sensors', grouped.binarySensors)}
-          ${this._renderEntityGroup('Switches', grouped.switches)}
-          ${this._renderEntityGroup('Buttons', grouped.buttons)}
-        </div>
-      </section>
-    `;
-  }
-
-  _renderEntityGroup(title, entities) {
-    if (!entities.length) {
-      return '';
-    }
-
-    return `
-      <section class="entity-group">
-        <h3>${this._escapeText(title)}</h3>
-        <div class="entity-list">
-          ${entities.map((entity) => this._renderEntityRow(entity)).join('')}
-        </div>
-      </section>
-    `;
-  }
-
-  _renderEntityRow(entity) {
-    const stateClass = this._normalizeText(entity.state.state) === 'on' ? ' on' : '';
-    const action = entity.domain === 'switch' ? (entity.state.state === 'on' ? 'turn_off' : 'turn_on') : 'press';
-    const actionLabel = entity.domain === 'switch' ? (entity.state.state === 'on' ? 'Turn Off' : 'Turn On') : 'Press';
-    const canControl = entity.domain === 'switch' || entity.domain === 'button';
-
-    return `
-      <article class="entity-row">
-        <div>
-          <div class="entity-name">${this._escapeText(entity.name)}</div>
-          <div class="entity-id">${this._escapeText(entity.entityId)}</div>
-        </div>
-        <div class="entity-state${stateClass}">${this._escapeText(entity.state.state)}</div>
-        ${canControl ? `<button class="control-action" type="button" data-entity-id="${this._escapeText(entity.entityId)}" data-action="${action}">${actionLabel}</button>` : ''}
-      </article>
-    `;
-  }
-
-  _renderEmpty() {
-    return '<section class="empty">No camera entities found in Home Assistant.</section>';
-  }
-
-  _renderFullscreen(camera) {
-    this._closeFullscreenElementOnly();
-
-    const overlay = document.createElement('section');
-    overlay.className = 'fullscreen';
-    overlay.setAttribute('role', 'dialog');
-    overlay.setAttribute('aria-modal', 'true');
-    overlay.innerHTML = `
-      <div class="fullscreen-bar">
-        <div class="fullscreen-title">${this._escapeText(camera.name)}</div>
-        <button class="close" type="button" aria-label="Close fullscreen camera">Close</button>
-      </div>
-      <div class="fullscreen-frame">
-        <img src="${this._cameraUrl(camera.entityId)}" alt="${this._escapeText(camera.name)} immersive live camera feed">
-      </div>
-    `;
-
-    overlay.querySelector('.close').addEventListener('click', () => this._closeFullscreen());
-    this.shadowRoot.appendChild(overlay);
-    overlay.querySelector('.close').focus();
-  }
-
-  _closeFullscreenElementOnly() {
-    const overlay = this.shadowRoot.querySelector('.fullscreen');
-    if (overlay) {
-      overlay.remove();
-    }
   }
 
   _escapeText(value) {
