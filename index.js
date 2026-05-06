@@ -1,3 +1,47 @@
+const CCTV_APP_ELEMENT_NAME = 'cctv_app';
+const CAMERA_PROXY_BASE = '/api/camera_proxy';
+
+const CCTV_APP_DEFAULTS = Object.freeze({
+  autoCycleIntervalSeconds: 8,
+  autoCycleMinSeconds: 5,
+  autoCycleMaxSeconds: 15,
+  motionWindowMs: 2 * 60 * 1000,
+  refreshIntervalMs: 30000,
+});
+
+const ENTITY_DOMAINS = Object.freeze({
+  camera: 'camera',
+  binarySensor: 'binary_sensor',
+  sensor: 'sensor',
+  switch: 'switch',
+  button: 'button',
+});
+
+const DEVICE_CONTROL_DOMAINS = new Set([
+  ENTITY_DOMAINS.sensor,
+  ENTITY_DOMAINS.binarySensor,
+  ENTITY_DOMAINS.switch,
+  ENTITY_DOMAINS.button,
+]);
+
+const MOTION_DEVICE_CLASSES = new Set(['motion', 'occupancy', 'presence']);
+const MOTION_MATCH_WORDS = ['motion', 'occupancy', 'presence', 'pir', 'person', 'activity', 'detection'];
+const CAMERA_RELATION_IGNORE_TOKENS = new Set([
+  'camera',
+  'binary',
+  'sensor',
+  'motion',
+  'occupancy',
+  'presence',
+  'pir',
+  'person',
+  'activity',
+  'detection',
+]);
+const OFFLINE_CAMERA_STATES = new Set(['unavailable', 'unknown']);
+const AUTO_CYCLE_SCOPES = new Set(['all', 'motion']);
+
+// Web component shell and Home Assistant lifecycle
 class CctvAppPanel extends HTMLElement {
   constructor() {
     super();
@@ -20,7 +64,7 @@ class CctvAppPanel extends HTMLElement {
     this._autoCycleEnabled = false;
     this._autoCyclePaused = false;
     this._autoCycleScope = 'all';
-    this._autoCycleInterval = 8;
+    this._autoCycleInterval = CCTV_APP_DEFAULTS.autoCycleIntervalSeconds;
     this._autoCycleEntityId = null;
     this._autoCycleTimer = null;
     this._motionRefreshTimer = null;
@@ -46,7 +90,7 @@ class CctvAppPanel extends HTMLElement {
     this._refs?.autoOverlay?.addEventListener('pointerdown', this._onAutoCyclePointer);
 
     if (!this._motionRefreshTimer) {
-      this._motionRefreshTimer = window.setInterval(() => this._scheduleUpdate(), 30000);
+      this._motionRefreshTimer = window.setInterval(() => this._scheduleUpdate(), CCTV_APP_DEFAULTS.refreshIntervalMs);
     }
 
     this._scheduleUpdate(true);
@@ -104,6 +148,7 @@ class CctvAppPanel extends HTMLElement {
     this._updateAutoCycleOverlay(cameras);
   }
 
+  // Static DOM shell (kept stable for future HACS frontend packaging)
   _ensureUi() {
     if (this._uiReady) {
       return;
@@ -135,8 +180,8 @@ class CctvAppPanel extends HTMLElement {
             <button type="button" class="cycle-button cycle-scope" data-cycle-scope="motion" aria-pressed="false">Motion Only</button>
           </div>
           <label class="cycle-range">
-            <span class="cycle-interval-label">8s</span>
-            <input class="cycle-interval" type="range" min="5" max="15" step="1" value="8" aria-label="Auto-cycle interval seconds">
+            <span class="cycle-interval-label">${CCTV_APP_DEFAULTS.autoCycleIntervalSeconds}s</span>
+            <input class="cycle-interval" type="range" min="${CCTV_APP_DEFAULTS.autoCycleMinSeconds}" max="${CCTV_APP_DEFAULTS.autoCycleMaxSeconds}" step="1" value="${CCTV_APP_DEFAULTS.autoCycleIntervalSeconds}" aria-label="Auto-cycle interval seconds">
           </label>
           <div class="fullscreen-actions cycle-actions">
             <button type="button" class="cycle-button cycle-start">Start Cycle</button>
@@ -260,6 +305,7 @@ class CctvAppPanel extends HTMLElement {
     this._uiReady = true;
   }
 
+  // Home Assistant state discovery and entity relationship logic
   _getCameras() {
     if (!this._hass || !this._hass.states) {
       return [];
@@ -267,7 +313,7 @@ class CctvAppPanel extends HTMLElement {
 
     const motionSensors = this._getMotionSensors();
     const cameras = Object.entries(this._hass.states)
-      .filter(([entityId]) => entityId.startsWith('camera.'))
+      .filter(([entityId]) => entityId.startsWith(`${ENTITY_DOMAINS.camera}.`))
       .map(([entityId, state]) => {
         const relatedMotion = motionSensors.find((sensor) => this._isRelatedMotionSensor(entityId, state, sensor));
 
@@ -302,11 +348,11 @@ class CctvAppPanel extends HTMLElement {
     }
 
     const now = Date.now();
-    const recentWindow = 2 * 60 * 1000;
+    const recentWindow = CCTV_APP_DEFAULTS.motionWindowMs;
 
     return Object.entries(this._hass.states)
       .filter(([entityId, state]) => {
-        if (!entityId.startsWith('binary_sensor.')) {
+        if (!entityId.startsWith(`${ENTITY_DOMAINS.binarySensor}.`)) {
           return false;
         }
 
@@ -330,9 +376,7 @@ class CctvAppPanel extends HTMLElement {
   _looksLikeMotionSensor(entityId, state) {
     const deviceClass = this._normalizeText(state.attributes?.device_class || '');
     const text = this._normalizeText(`${entityId} ${state.attributes?.friendly_name || ''}`);
-    const motionWords = ['motion', 'occupancy', 'presence', 'pir', 'person', 'activity', 'detection'];
-
-    return ['motion', 'occupancy', 'presence'].includes(deviceClass) || motionWords.some((word) => text.includes(word));
+    return MOTION_DEVICE_CLASSES.has(deviceClass) || MOTION_MATCH_WORDS.some((word) => text.includes(word));
   }
 
   _isRelatedMotionSensor(cameraEntityId, cameraState, sensor) {
@@ -342,8 +386,7 @@ class CctvAppPanel extends HTMLElement {
     }
 
     const cameraTokens = this._tokens(`${cameraEntityId} ${cameraState.attributes?.friendly_name || ''}`);
-    const ignored = new Set(['camera', 'binary', 'sensor', 'motion', 'occupancy', 'presence', 'pir', 'person', 'activity', 'detection']);
-    const cameraKeyTokens = cameraTokens.filter((token) => !ignored.has(token) && token.length > 2);
+    const cameraKeyTokens = cameraTokens.filter((token) => !CAMERA_RELATION_IGNORE_TOKENS.has(token) && token.length > 2);
 
     return cameraKeyTokens.some((token) => sensor.tokens.includes(token) || sensor.text.includes(token));
   }
@@ -359,12 +402,10 @@ class CctvAppPanel extends HTMLElement {
       return [];
     }
 
-    const allowedDomains = new Set(['sensor', 'binary_sensor', 'switch', 'button']);
-
     return Object.entries(this._hass.states)
       .filter(([entityId, state]) => {
         const domain = this._domain(entityId);
-        return allowedDomains.has(domain) && this._deviceIdForEntity(entityId, state) === cameraDeviceId;
+        return DEVICE_CONTROL_DOMAINS.has(domain) && this._deviceIdForEntity(entityId, state) === cameraDeviceId;
       })
       .sort(([leftId], [rightId]) => leftId.localeCompare(rightId))
       .map(([entityId, state]) => ({
@@ -377,10 +418,10 @@ class CctvAppPanel extends HTMLElement {
 
   _groupDeviceEntities(entities) {
     return {
-      sensors: entities.filter((entity) => entity.domain === 'sensor'),
-      binarySensors: entities.filter((entity) => entity.domain === 'binary_sensor'),
-      switches: entities.filter((entity) => entity.domain === 'switch'),
-      buttons: entities.filter((entity) => entity.domain === 'button'),
+      sensors: entities.filter((entity) => entity.domain === ENTITY_DOMAINS.sensor),
+      binarySensors: entities.filter((entity) => entity.domain === ENTITY_DOMAINS.binarySensor),
+      switches: entities.filter((entity) => entity.domain === ENTITY_DOMAINS.switch),
+      buttons: entities.filter((entity) => entity.domain === ENTITY_DOMAINS.button),
     };
   }
 
@@ -395,6 +436,7 @@ class CctvAppPanel extends HTMLElement {
     );
   }
 
+  // Incremental DOM updates
   _updateGridPage(cameras) {
     const inGrid = this._view === 'grid';
     const motionCount = cameras.filter((camera) => camera.hasMotion).length;
@@ -593,11 +635,11 @@ class CctvAppPanel extends HTMLElement {
   }
 
   _updateEntityRow(row, entity) {
-    const canControl = entity.domain === 'switch' || entity.domain === 'button';
-    const action = entity.domain === 'switch' ? (entity.state.state === 'on' ? 'turn_off' : 'turn_on') : 'press';
-    const actionLabel = entity.domain === 'switch' ? (entity.state.state === 'on' ? 'Turn Off' : 'Turn On') : 'Press';
+    const canControl = entity.domain === ENTITY_DOMAINS.switch || entity.domain === ENTITY_DOMAINS.button;
+    const action = entity.domain === ENTITY_DOMAINS.switch ? (entity.state.state === 'on' ? 'turn_off' : 'turn_on') : 'press';
+    const actionLabel = entity.domain === ENTITY_DOMAINS.switch ? (entity.state.state === 'on' ? 'Turn Off' : 'Turn On') : 'Press';
     const stateClass = this._normalizeText(entity.state.state) === 'on' ? ' on' : '';
-    const groupName = entity.domain === 'binary_sensor' ? 'binarySensors' : `${entity.domain}s`;
+    const groupName = entity.domain === ENTITY_DOMAINS.binarySensor ? 'binarySensors' : `${entity.domain}s`;
     const signature = [entity.name, entity.entityId, entity.state.state, canControl, action, actionLabel, groupName].join('|');
 
     if (row.signature === signature) {
@@ -676,6 +718,7 @@ class CctvAppPanel extends HTMLElement {
     return 'scale-balanced';
   }
 
+  // View state and auto-cycle controls
   _openCameraDetail(entityId, mode = 'fullscreen') {
     if (!this._lastCameras.some((camera) => camera.entityId === entityId)) {
       return;
@@ -822,7 +865,7 @@ class CctvAppPanel extends HTMLElement {
   }
 
   _setAutoCycleInterval(value) {
-    const nextInterval = Math.min(15, Math.max(5, Number(value) || 8));
+    const nextInterval = Math.min(CCTV_APP_DEFAULTS.autoCycleMaxSeconds, Math.max(CCTV_APP_DEFAULTS.autoCycleMinSeconds, Number(value) || CCTV_APP_DEFAULTS.autoCycleIntervalSeconds));
     if (this._autoCycleInterval === nextInterval) {
       return;
     }
@@ -833,7 +876,7 @@ class CctvAppPanel extends HTMLElement {
   }
 
   _setAutoCycleScope(scope) {
-    if (!['all', 'motion'].includes(scope) || this._autoCycleScope === scope) {
+    if (!AUTO_CYCLE_SCOPES.has(scope) || this._autoCycleScope === scope) {
       return;
     }
 
@@ -858,6 +901,7 @@ class CctvAppPanel extends HTMLElement {
     return cycleCameras.find((camera) => camera.entityId === this._autoCycleEntityId) || cycleCameras[0] || null;
   }
 
+  // Delegated event handling
   _handleKeyDown(event) {
     if (event.key !== 'Escape') {
       return;
@@ -972,17 +1016,18 @@ class CctvAppPanel extends HTMLElement {
     }
 
     const domain = this._domain(entityId);
-    if (domain === 'switch') {
-      this._hass.callService('switch', action, { entity_id: entityId });
+    if (domain === ENTITY_DOMAINS.switch) {
+      this._hass.callService(ENTITY_DOMAINS.switch, action, { entity_id: entityId });
     }
 
-    if (domain === 'button') {
-      this._hass.callService('button', 'press', { entity_id: entityId });
+    if (domain === ENTITY_DOMAINS.button) {
+      this._hass.callService(ENTITY_DOMAINS.button, 'press', { entity_id: entityId });
     }
   }
 
+  // Small utility helpers
   _isOnlineCameraState(state) {
-    return Boolean(state) && !['unavailable', 'unknown'].includes(String(state.state).toLowerCase());
+    return Boolean(state) && !OFFLINE_CAMERA_STATES.has(String(state.state).toLowerCase());
   }
 
   _similarDeviceId(left, right) {
@@ -1007,9 +1052,10 @@ class CctvAppPanel extends HTMLElement {
   }
 
   _cameraUrl(entityId) {
-    return `/api/camera_proxy/${encodeURIComponent(entityId)}`;
+    return `${CAMERA_PROXY_BASE}/${encodeURIComponent(entityId)}`;
   }
 
+  // Component styles
   _styles() {
     return `
       <style>
@@ -1770,6 +1816,7 @@ class CctvAppPanel extends HTMLElement {
   }
 }
 
-if (!customElements.get("cctv_app")) {
-  customElements.define("cctv_app", CctvAppPanel);
+// Custom element registration
+if (!customElements.get(CCTV_APP_ELEMENT_NAME)) {
+  customElements.define(CCTV_APP_ELEMENT_NAME, CctvAppPanel);
 }
