@@ -3,13 +3,22 @@ class CctvAppPanel extends HTMLElement {
     super();
     this.attachShadow({ mode: 'open' });
     this._hass = null;
-    this._camerasSignature = null;
-    this._selectedCamera = null;
+    this._renderSignature = null;
+    this._view = 'grid';
+    this._detailMode = 'fullscreen';
+    this._selectedCameraEntityId = null;
     this._motionPriority = true;
     this._motionRefreshTimer = null;
     this._escapeHandler = (event) => {
       if (event.key === 'Escape') {
-        this._closeFullscreen();
+        if (this.shadowRoot.querySelector('.fullscreen')) {
+          this._closeFullscreen();
+          return;
+        }
+
+        if (this._view === 'detail') {
+          this._backToGrid();
+        }
       }
     };
   }
@@ -37,12 +46,18 @@ class CctvAppPanel extends HTMLElement {
 
   _renderIfNeeded(force = false) {
     const cameras = this._getCameras();
-    const signature = `${this._motionPriority}:${cameras
-      .map((camera) => `${camera.entityId}:${camera.name}:${camera.hasMotion}:${camera.motionSensorId || ''}:${camera.motionLastChanged || ''}`)
-      .join('|')}`;
+    const selectedEntities = this._selectedCameraEntityId ? this._getDeviceEntities(this._selectedCameraEntityId) : [];
+    const signature = [
+      this._view,
+      this._detailMode,
+      this._selectedCameraEntityId || '',
+      this._motionPriority,
+      cameras.map((camera) => `${camera.entityId}:${camera.name}:${camera.hasMotion}:${camera.motionSensorId}:${camera.motionLastChanged}`).join('|'),
+      selectedEntities.map((entity) => `${entity.entityId}:${entity.state.state}:${entity.name}`).join('|'),
+    ].join('::');
 
-    if (force || signature !== this._camerasSignature) {
-      this._camerasSignature = signature;
+    if (force || signature !== this._renderSignature) {
+      this._renderSignature = signature;
       this._render(cameras);
     }
   }
@@ -61,6 +76,7 @@ class CctvAppPanel extends HTMLElement {
         return {
           entityId,
           name: state.attributes?.friendly_name || entityId,
+          deviceId: this._deviceIdForEntity(entityId, state),
           hasMotion: Boolean(relatedMotion),
           motionSensorId: relatedMotion?.entityId || '',
           motionLastChanged: relatedMotion?.lastChanged || '',
@@ -101,7 +117,7 @@ class CctvAppPanel extends HTMLElement {
         entityId,
         state,
         lastChanged: state.last_changed,
-        deviceId: this._normalizeText(state.attributes?.device_id || state.attributes?.device || ''),
+        deviceId: this._normalizeText(this._deviceIdForEntity(entityId, state)),
         text: this._normalizeText(`${entityId} ${state.attributes?.friendly_name || ''}`),
         tokens: this._tokens(`${entityId} ${state.attributes?.friendly_name || ''}`),
       }));
@@ -116,7 +132,7 @@ class CctvAppPanel extends HTMLElement {
   }
 
   _isRelatedMotionSensor(cameraEntityId, cameraState, sensor) {
-    const cameraDeviceId = this._normalizeText(cameraState.attributes?.device_id || cameraState.attributes?.device || '');
+    const cameraDeviceId = this._normalizeText(this._deviceIdForEntity(cameraEntityId, cameraState));
     if (cameraDeviceId && sensor.deviceId && this._similarDeviceId(cameraDeviceId, sensor.deviceId)) {
       return true;
     }
@@ -126,6 +142,53 @@ class CctvAppPanel extends HTMLElement {
     const cameraKeyTokens = cameraTokens.filter((token) => !ignored.has(token) && token.length > 2);
 
     return cameraKeyTokens.some((token) => sensor.tokens.includes(token) || sensor.text.includes(token));
+  }
+
+  _getDeviceEntities(cameraEntityId) {
+    if (!this._hass || !this._hass.states) {
+      return [];
+    }
+
+    const cameraState = this._hass.states[cameraEntityId];
+    const cameraDeviceId = this._deviceIdForEntity(cameraEntityId, cameraState);
+    if (!cameraDeviceId) {
+      return [];
+    }
+
+    const allowedDomains = new Set(['sensor', 'binary_sensor', 'switch', 'button']);
+
+    return Object.entries(this._hass.states)
+      .filter(([entityId, state]) => {
+        const domain = this._domain(entityId);
+        return allowedDomains.has(domain) && this._deviceIdForEntity(entityId, state) === cameraDeviceId;
+      })
+      .sort(([leftId], [rightId]) => leftId.localeCompare(rightId))
+      .map(([entityId, state]) => ({
+        entityId,
+        state,
+        domain: this._domain(entityId),
+        name: state.attributes?.friendly_name || entityId,
+      }));
+  }
+
+  _groupDeviceEntities(entities) {
+    return {
+      sensors: entities.filter((entity) => entity.domain === 'sensor'),
+      binarySensors: entities.filter((entity) => entity.domain === 'binary_sensor'),
+      switches: entities.filter((entity) => entity.domain === 'switch'),
+      buttons: entities.filter((entity) => entity.domain === 'button'),
+    };
+  }
+
+  _deviceIdForEntity(entityId, state) {
+    return String(
+      state?.attributes?.device_id ||
+        state?.attributes?.device ||
+        state?.attributes?.device_identifier ||
+        this._hass?.entities?.[entityId]?.device_id ||
+        this._hass?.entityRegistry?.[entityId]?.device_id ||
+        '',
+    );
   }
 
   _similarDeviceId(left, right) {
@@ -145,30 +208,45 @@ class CctvAppPanel extends HTMLElement {
       .trim();
   }
 
+  _domain(entityId) {
+    return entityId.split('.')[0];
+  }
+
   _cameraUrl(entityId) {
     return `/api/camera_proxy/${encodeURIComponent(entityId)}`;
   }
 
-  _openFullscreen(entityId) {
+  _openCameraDetail(entityId, mode = 'fullscreen') {
     const camera = this._getCameras().find((item) => item.entityId === entityId);
     if (!camera) {
       return;
     }
 
-    this._selectedCamera = camera;
-    this._renderFullscreen();
+    this._selectedCameraEntityId = entityId;
+    this._detailMode = mode;
+    this._view = 'detail';
+    this._renderIfNeeded(true);
   }
 
-  _closeFullscreen() {
-    if (!this._selectedCamera) {
+  _backToGrid() {
+    this._view = 'grid';
+    this._detailMode = 'fullscreen';
+    this._selectedCameraEntityId = null;
+    this._closeFullscreenElementOnly();
+    this._renderIfNeeded(true);
+  }
+
+  _openFullscreen(entityId = this._selectedCameraEntityId) {
+    const camera = this._getCameras().find((item) => item.entityId === entityId);
+    if (!camera) {
       return;
     }
 
-    this._selectedCamera = null;
-    const overlay = this.shadowRoot.querySelector('.fullscreen');
-    if (overlay) {
-      overlay.remove();
-    }
+    this._renderFullscreen(camera);
+  }
+
+  _closeFullscreen() {
+    this._closeFullscreenElementOnly();
   }
 
   _setMotionPriority(enabled) {
@@ -180,16 +258,51 @@ class CctvAppPanel extends HTMLElement {
     this._renderIfNeeded(true);
   }
 
-  _render(cameras) {
-    const motionCount = cameras.filter((camera) => camera.hasMotion).length;
+  _setDetailMode(mode) {
+    if (this._detailMode === mode) {
+      return;
+    }
 
-    this.shadowRoot.innerHTML = `
+    this._detailMode = mode;
+    this._renderIfNeeded(true);
+  }
+
+  _callEntityService(entityId, action) {
+    if (!this._hass || !this._hass.callService) {
+      return;
+    }
+
+    const domain = this._domain(entityId);
+    if (domain === 'switch') {
+      this._hass.callService('switch', action, { entity_id: entityId });
+    }
+
+    if (domain === 'button') {
+      this._hass.callService('button', 'press', { entity_id: entityId });
+    }
+  }
+
+  _render(cameras) {
+    const selectedCamera = cameras.find((camera) => camera.entityId === this._selectedCameraEntityId);
+
+    if (this._view === 'detail' && selectedCamera) {
+      this._renderDetail(cameras, selectedCamera);
+      return;
+    }
+
+    this._view = 'grid';
+    this._renderGridPage(cameras);
+  }
+
+  _styles() {
+    return `
       <style>
         :host {
           display: block;
           min-height: 100vh;
           color: #e8fbff;
           background:
+            linear-gradient(135deg, rgba(0, 229, 255, 0.08), transparent 24rem),
             radial-gradient(circle at top left, rgba(0, 255, 255, 0.14), transparent 32rem),
             radial-gradient(circle at bottom right, rgba(78, 70, 255, 0.13), transparent 30rem),
             #070b13;
@@ -201,13 +314,18 @@ class CctvAppPanel extends HTMLElement {
           box-sizing: border-box;
         }
 
+        button {
+          font: inherit;
+        }
+
         .shell {
           width: min(1800px, 100%);
           margin: 0 auto;
           padding: clamp(1rem, 2.5vw, 2rem);
         }
 
-        .header {
+        .header,
+        .detail-topbar {
           display: flex;
           align-items: end;
           justify-content: space-between;
@@ -215,21 +333,40 @@ class CctvAppPanel extends HTMLElement {
           margin-bottom: 1.4rem;
         }
 
-        h1 {
+        h1,
+        h2,
+        h3 {
           margin: 0;
+        }
+
+        h1 {
           font-size: clamp(1.6rem, 3vw, 2.7rem);
-          font-weight: 700;
+          font-weight: 800;
           letter-spacing: 0.08em;
           text-transform: uppercase;
           text-shadow: 0 0 24px rgba(0, 229, 255, 0.22);
         }
 
-        .status {
-          color: #8fbac4;
-          font-size: 0.92rem;
+        h2 {
+          font-size: clamp(1.25rem, 2.3vw, 2rem);
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+        }
+
+        h3 {
+          color: #e8fbff;
+          font-size: 0.9rem;
           letter-spacing: 0.08em;
           text-transform: uppercase;
-          white-space: nowrap;
+        }
+
+        .status,
+        .meta,
+        .entity-id {
+          color: #8fbac4;
+          font-size: 0.86rem;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
         }
 
         .toolbar {
@@ -241,7 +378,8 @@ class CctvAppPanel extends HTMLElement {
           flex-wrap: wrap;
         }
 
-        .toggle {
+        .toggle,
+        .detail-tabs {
           display: inline-flex;
           gap: 0.25rem;
           padding: 0.28rem;
@@ -251,37 +389,62 @@ class CctvAppPanel extends HTMLElement {
           box-shadow: 0 0 24px rgba(0, 229, 255, 0.06);
         }
 
-        .toggle button {
-          border: 0;
+        .toggle button,
+        .detail-tabs button,
+        .back,
+        .close,
+        .control-action,
+        .fullscreen-action {
+          border: 1px solid transparent;
           border-radius: 999px;
           padding: 0.65rem 0.9rem;
           color: #8fbac4;
           background: transparent;
           cursor: pointer;
-          font: inherit;
-          font-size: 0.82rem;
-          font-weight: 700;
+          font-weight: 800;
           letter-spacing: 0.06em;
           text-transform: uppercase;
-          transition: background 140ms ease, color 140ms ease, box-shadow 140ms ease;
+          transition: background 140ms ease, color 140ms ease, border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
         }
 
-        .toggle button[aria-pressed="true"] {
+        .toggle button[aria-pressed="true"],
+        .detail-tabs button[aria-pressed="true"] {
           color: #e8fbff;
           background: rgba(0, 229, 255, 0.14);
           box-shadow: inset 0 0 0 1px rgba(105, 241, 255, 0.28), 0 0 22px rgba(0, 229, 255, 0.12);
         }
 
+        .back,
+        .close,
+        .control-action,
+        .fullscreen-action {
+          border-color: rgba(105, 241, 255, 0.35);
+          color: #e8fbff;
+          background: rgba(0, 229, 255, 0.08);
+        }
+
         .toggle button:hover,
-        .toggle button:focus-visible {
+        .toggle button:focus-visible,
+        .detail-tabs button:hover,
+        .detail-tabs button:focus-visible,
+        .back:hover,
+        .back:focus-visible,
+        .close:hover,
+        .close:focus-visible,
+        .control-action:hover,
+        .control-action:focus-visible,
+        .fullscreen-action:hover,
+        .fullscreen-action:focus-visible {
+          border-color: rgba(105, 241, 255, 0.75);
           color: #e8fbff;
           outline: none;
+          transform: translateY(-1px);
         }
 
         .motion-summary {
-          color: ${motionCount ? '#ffb8b8' : '#8fbac4'};
+          color: #ffb8b8;
           font-size: 0.86rem;
-          font-weight: 700;
+          font-weight: 800;
           letter-spacing: 0.06em;
           text-transform: uppercase;
         }
@@ -292,13 +455,18 @@ class CctvAppPanel extends HTMLElement {
           gap: clamp(0.85rem, 1.7vw, 1.25rem);
         }
 
+        .card,
+        .dashboard-panel,
+        .entity-group {
+          border: 1px solid rgba(87, 222, 255, 0.18);
+          border-radius: 18px;
+          background: linear-gradient(145deg, rgba(9, 18, 32, 0.86), rgba(5, 10, 20, 0.72));
+          box-shadow: 0 14px 50px rgba(0, 0, 0, 0.34), 0 0 28px rgba(0, 225, 255, 0.05);
+        }
+
         .card {
           position: relative;
           overflow: hidden;
-          border: 1px solid rgba(87, 222, 255, 0.18);
-          border-radius: 18px;
-          background: rgba(9, 18, 32, 0.78);
-          box-shadow: 0 14px 50px rgba(0, 0, 0, 0.34), 0 0 28px rgba(0, 225, 255, 0.05);
           cursor: pointer;
           transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
         }
@@ -333,18 +501,26 @@ class CctvAppPanel extends HTMLElement {
           }
         }
 
-        .frame {
+        .frame,
+        .detail-feed {
           position: relative;
-          aspect-ratio: 16 / 9;
+          overflow: hidden;
           background: linear-gradient(135deg, #0b1220, #111827);
         }
 
-        .frame::after {
+        .frame {
+          aspect-ratio: 16 / 9;
+        }
+
+        .frame::after,
+        .detail-feed::after {
           content: '';
           position: absolute;
           inset: 0;
           pointer-events: none;
-          background: linear-gradient(180deg, transparent 70%, rgba(0, 0, 0, 0.32));
+          background:
+            linear-gradient(180deg, transparent 68%, rgba(0, 0, 0, 0.36)),
+            repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.025) 0 1px, transparent 1px 5px);
         }
 
         .motion-badge {
@@ -362,12 +538,13 @@ class CctvAppPanel extends HTMLElement {
           background: rgba(88, 0, 0, 0.62);
           box-shadow: 0 0 22px rgba(255, 43, 43, 0.26);
           font-size: 0.72rem;
-          font-weight: 800;
+          font-weight: 900;
           letter-spacing: 0.08em;
           text-transform: uppercase;
         }
 
-        .motion-badge::before {
+        .motion-badge::before,
+        .motion-dot {
           content: '';
           width: 0.48rem;
           height: 0.48rem;
@@ -391,17 +568,8 @@ class CctvAppPanel extends HTMLElement {
           padding: 0.85rem 1rem 1rem;
           color: #d9f9ff;
           font-size: 0.98rem;
-          font-weight: 600;
+          font-weight: 700;
           letter-spacing: 0.02em;
-        }
-
-        .motion-dot {
-          flex: 0 0 auto;
-          width: 0.55rem;
-          height: 0.55rem;
-          border-radius: 50%;
-          background: #ff3d3d;
-          box-shadow: 0 0 14px rgba(255, 61, 61, 0.9);
         }
 
         .empty {
@@ -413,6 +581,118 @@ class CctvAppPanel extends HTMLElement {
           color: #8fbac4;
           background: rgba(9, 18, 32, 0.5);
           text-align: center;
+        }
+
+        .detail-shell {
+          display: grid;
+          gap: 1rem;
+        }
+
+        .detail-topbar {
+          align-items: center;
+          margin-bottom: 0;
+        }
+
+        .detail-title {
+          min-width: 0;
+          display: grid;
+          gap: 0.25rem;
+        }
+
+        .detail-title h2,
+        .entity-name {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .dashboard-panel {
+          overflow: hidden;
+          min-height: 62vh;
+        }
+
+        .detail-feed {
+          height: min(70vh, 760px);
+          border-radius: 18px;
+        }
+
+        .detail-feed img {
+          object-fit: contain;
+        }
+
+        .feed-hud {
+          position: absolute;
+          inset: auto 1rem 1rem 1rem;
+          z-index: 1;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 1rem;
+          padding: 0.8rem;
+          border: 1px solid rgba(87, 222, 255, 0.18);
+          border-radius: 14px;
+          background: rgba(3, 6, 12, 0.72);
+          backdrop-filter: blur(12px);
+        }
+
+        .control-grid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 1rem;
+          padding: 1rem;
+        }
+
+        .entity-group {
+          min-width: 0;
+          padding: 1rem;
+        }
+
+        .entity-list {
+          display: grid;
+          gap: 0.7rem;
+          margin-top: 0.85rem;
+        }
+
+        .entity-row {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          align-items: center;
+          gap: 0.75rem;
+          padding: 0.8rem;
+          border: 1px solid rgba(87, 222, 255, 0.12);
+          border-radius: 14px;
+          background: rgba(2, 9, 18, 0.46);
+        }
+
+        .entity-name {
+          color: #d9f9ff;
+          font-weight: 800;
+        }
+
+        .entity-state {
+          justify-self: end;
+          border: 1px solid rgba(143, 186, 196, 0.18);
+          border-radius: 999px;
+          padding: 0.35rem 0.55rem;
+          color: #e8fbff;
+          background: rgba(0, 229, 255, 0.08);
+          font-size: 0.78rem;
+          font-weight: 900;
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+        }
+
+        .entity-state.on {
+          border-color: rgba(94, 255, 177, 0.42);
+          color: #caffdf;
+          background: rgba(21, 156, 91, 0.18);
+          box-shadow: 0 0 16px rgba(21, 156, 91, 0.2);
+        }
+
+        .control-action {
+          grid-column: 1 / -1;
+          justify-self: start;
+          padding-inline: 1rem;
         }
 
         .fullscreen {
@@ -440,31 +720,11 @@ class CctvAppPanel extends HTMLElement {
           overflow: hidden;
           color: #e8fbff;
           font-size: clamp(1rem, 2vw, 1.3rem);
-          font-weight: 700;
+          font-weight: 800;
           letter-spacing: 0.05em;
           text-overflow: ellipsis;
           text-transform: uppercase;
           white-space: nowrap;
-        }
-
-        .close {
-          border: 1px solid rgba(105, 241, 255, 0.35);
-          border-radius: 999px;
-          padding: 0.65rem 1rem;
-          color: #e8fbff;
-          background: rgba(0, 229, 255, 0.08);
-          cursor: pointer;
-          font: inherit;
-          font-weight: 700;
-          letter-spacing: 0.06em;
-          text-transform: uppercase;
-        }
-
-        .close:hover,
-        .close:focus-visible {
-          border-color: rgba(105, 241, 255, 0.75);
-          background: rgba(0, 229, 255, 0.16);
-          outline: none;
         }
 
         .fullscreen-frame {
@@ -482,11 +742,31 @@ class CctvAppPanel extends HTMLElement {
           border-radius: 14px;
           box-shadow: 0 0 45px rgba(0, 229, 255, 0.12);
         }
-      </style>
 
+        @media (max-width: 900px) {
+          .header,
+          .detail-topbar,
+          .feed-hud {
+            align-items: stretch;
+            flex-direction: column;
+          }
+
+          .control-grid {
+            grid-template-columns: 1fr;
+          }
+        }
+      </style>
+    `;
+  }
+
+  _renderGridPage(cameras) {
+    const motionCount = cameras.filter((camera) => camera.hasMotion).length;
+
+    this.shadowRoot.innerHTML = `
+      ${this._styles()}
       <main class="shell">
         <header class="header">
-          <h1>CCTV</h1>
+          <h1>CCTV Control Center</h1>
           <div class="status">${cameras.length} camera${cameras.length === 1 ? '' : 's'} detected</div>
         </header>
 
@@ -498,7 +778,7 @@ class CctvAppPanel extends HTMLElement {
           <div class="motion-summary">${motionCount} recent motion event${motionCount === 1 ? '' : 's'}</div>
         </section>
 
-        ${cameras.length ? this._renderGrid(cameras) : this._renderEmpty()}
+        ${cameras.length ? this._renderCameraGrid(cameras) : this._renderEmpty()}
       </main>
     `;
 
@@ -507,27 +787,23 @@ class CctvAppPanel extends HTMLElement {
     });
 
     this.shadowRoot.querySelectorAll('.card').forEach((card) => {
-      card.addEventListener('click', () => this._openFullscreen(card.dataset.entityId));
+      card.addEventListener('click', () => this._openCameraDetail(card.dataset.entityId));
       card.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
-          this._openFullscreen(card.dataset.entityId);
+          this._openCameraDetail(card.dataset.entityId);
         }
       });
     });
-
-    if (this._selectedCamera) {
-      this._renderFullscreen();
-    }
   }
 
-  _renderGrid(cameras) {
+  _renderCameraGrid(cameras) {
     return `
       <section class="grid" aria-label="Camera feeds">
         ${cameras
           .map(
             (camera) => `
-              <article class="card${camera.hasMotion ? ' motion' : ''}" tabindex="0" role="button" aria-label="Open ${this._escapeText(camera.name)} fullscreen" data-entity-id="${this._escapeText(camera.entityId)}">
+              <article class="card${camera.hasMotion ? ' motion' : ''}" tabindex="0" role="button" aria-label="Open ${this._escapeText(camera.name)} detail dashboard" data-entity-id="${this._escapeText(camera.entityId)}">
                 <div class="frame">
                   ${camera.hasMotion ? '<span class="motion-badge">Motion</span>' : ''}
                   <img loading="lazy" decoding="async" src="${this._cameraUrl(camera.entityId)}" alt="${this._escapeText(camera.name)} live camera feed">
@@ -544,14 +820,111 @@ class CctvAppPanel extends HTMLElement {
     `;
   }
 
+  _renderDetail(cameras, camera) {
+    const deviceEntities = this._getDeviceEntities(camera.entityId);
+    const grouped = this._groupDeviceEntities(deviceEntities);
+
+    this.shadowRoot.innerHTML = `
+      ${this._styles()}
+      <main class="shell detail-shell">
+        <header class="detail-topbar">
+          <button class="back" type="button">Back to Grid</button>
+          <div class="detail-title">
+            <h2>${this._escapeText(camera.name)}</h2>
+            <div class="meta">${this._escapeText(camera.entityId)} · ${camera.deviceId ? `Device ${this._escapeText(camera.deviceId)}` : 'No device_id exposed'}</div>
+          </div>
+          <div class="detail-tabs" role="group" aria-label="Camera detail mode">
+            <button type="button" class="detail-mode" data-detail-mode="fullscreen" aria-pressed="${this._detailMode === 'fullscreen'}">Fullscreen View</button>
+            <button type="button" class="detail-mode" data-detail-mode="controls" aria-pressed="${this._detailMode === 'controls'}">Device Controls</button>
+          </div>
+        </header>
+
+        ${this._detailMode === 'controls' ? this._renderControlPanel(grouped, camera) : this._renderDetailFeed(camera)}
+      </main>
+    `;
+
+    this.shadowRoot.querySelector('.back')?.addEventListener('click', () => this._backToGrid());
+    this.shadowRoot.querySelectorAll('.detail-mode').forEach((button) => {
+      button.addEventListener('click', () => this._setDetailMode(button.dataset.detailMode));
+    });
+    this.shadowRoot.querySelector('.fullscreen-action')?.addEventListener('click', () => this._openFullscreen(camera.entityId));
+    this.shadowRoot.querySelectorAll('.control-action').forEach((button) => {
+      button.addEventListener('click', () => this._callEntityService(button.dataset.entityId, button.dataset.action));
+    });
+  }
+
+  _renderDetailFeed(camera) {
+    return `
+      <section class="dashboard-panel detail-feed" aria-label="Fullscreen camera view">
+        ${camera.hasMotion ? '<span class="motion-badge">Motion</span>' : ''}
+        <img src="${this._cameraUrl(camera.entityId)}" alt="${this._escapeText(camera.name)} fullscreen live camera feed">
+        <div class="feed-hud">
+          <div>
+            <div class="entity-name">Live tactical feed</div>
+            <div class="entity-id">${this._escapeText(camera.entityId)}</div>
+          </div>
+          <button class="fullscreen-action" type="button">Open Immersive</button>
+        </div>
+      </section>
+    `;
+  }
+
+  _renderControlPanel(grouped, camera) {
+    const total = grouped.sensors.length + grouped.binarySensors.length + grouped.switches.length + grouped.buttons.length;
+
+    return `
+      <section class="dashboard-panel" aria-label="Device control panel">
+        <div class="control-grid">
+          ${total ? '' : `<section class="empty">No sensor, binary_sensor, switch, or button entities share the device_id for ${this._escapeText(camera.name)}.</section>`}
+          ${this._renderEntityGroup('Sensors', grouped.sensors)}
+          ${this._renderEntityGroup('Binary Sensors', grouped.binarySensors)}
+          ${this._renderEntityGroup('Switches', grouped.switches)}
+          ${this._renderEntityGroup('Buttons', grouped.buttons)}
+        </div>
+      </section>
+    `;
+  }
+
+  _renderEntityGroup(title, entities) {
+    if (!entities.length) {
+      return '';
+    }
+
+    return `
+      <section class="entity-group">
+        <h3>${this._escapeText(title)}</h3>
+        <div class="entity-list">
+          ${entities.map((entity) => this._renderEntityRow(entity)).join('')}
+        </div>
+      </section>
+    `;
+  }
+
+  _renderEntityRow(entity) {
+    const stateClass = this._normalizeText(entity.state.state) === 'on' ? ' on' : '';
+    const action = entity.domain === 'switch' ? (entity.state.state === 'on' ? 'turn_off' : 'turn_on') : 'press';
+    const actionLabel = entity.domain === 'switch' ? (entity.state.state === 'on' ? 'Turn Off' : 'Turn On') : 'Press';
+    const canControl = entity.domain === 'switch' || entity.domain === 'button';
+
+    return `
+      <article class="entity-row">
+        <div>
+          <div class="entity-name">${this._escapeText(entity.name)}</div>
+          <div class="entity-id">${this._escapeText(entity.entityId)}</div>
+        </div>
+        <div class="entity-state${stateClass}">${this._escapeText(entity.state.state)}</div>
+        ${canControl ? `<button class="control-action" type="button" data-entity-id="${this._escapeText(entity.entityId)}" data-action="${action}">${actionLabel}</button>` : ''}
+      </article>
+    `;
+  }
+
   _renderEmpty() {
     return '<section class="empty">No camera entities found in Home Assistant.</section>';
   }
 
-  _renderFullscreen() {
+  _renderFullscreen(camera) {
     this._closeFullscreenElementOnly();
 
-    const camera = this._selectedCamera;
     const overlay = document.createElement('section');
     overlay.className = 'fullscreen';
     overlay.setAttribute('role', 'dialog');
@@ -562,7 +935,7 @@ class CctvAppPanel extends HTMLElement {
         <button class="close" type="button" aria-label="Close fullscreen camera">Close</button>
       </div>
       <div class="fullscreen-frame">
-        <img src="${this._cameraUrl(camera.entityId)}" alt="${this._escapeText(camera.name)} fullscreen live camera feed">
+        <img src="${this._cameraUrl(camera.entityId)}" alt="${this._escapeText(camera.name)} immersive live camera feed">
       </div>
     `;
 
