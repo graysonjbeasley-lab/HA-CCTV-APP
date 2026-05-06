@@ -3,7 +3,7 @@ class CctvAppPanel extends HTMLElement {
     super();
     this.attachShadow({ mode: 'open' });
     this._hass = null;
-    this._camerasSignature = '';
+    this._camerasSignature = null;
     this._selectedCamera = null;
     this._escapeHandler = (event) => {
       if (event.key === 'Escape') {
@@ -14,27 +14,29 @@ class CctvAppPanel extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    this._renderIfNeeded();
+  }
 
+  connectedCallback() {
+    document.addEventListener('keydown', this._escapeHandler);
+    this._renderIfNeeded(true);
+  }
+
+  disconnectedCallback() {
+    document.removeEventListener('keydown', this._escapeHandler);
+  }
+
+
+  _renderIfNeeded(force = false) {
     const cameras = this._getCameras();
     const signature = cameras
       .map((camera) => `${camera.entityId}:${camera.name}`)
       .join('|');
 
-    if (!this.shadowRoot.innerHTML || signature !== this._camerasSignature) {
+    if (force || signature !== this._camerasSignature) {
       this._camerasSignature = signature;
       this._render(cameras);
     }
-  }
-
-  connectedCallback() {
-    document.addEventListener('keydown', this._escapeHandler);
-    if (!this.shadowRoot.innerHTML) {
-      this._render([]);
-    }
-  }
-
-  disconnectedCallback() {
-    document.removeEventListener('keydown', this._escapeHandler);
   }
 
   _getCameras() {
@@ -348,6 +350,6 @@ class CctvAppPanel extends HTMLElement {
   }
 }
 
-if (!customElements.get('cctv-app')) {
-  customElements.define('cctv-app', CctvAppPanel);
+if (!customElements.get("cctv_app")) {
+  customElements.define("cctv_app", CctvAppPanel);
 }
