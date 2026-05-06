@@ -8,10 +8,22 @@ class CctvAppPanel extends HTMLElement {
     this._detailMode = 'fullscreen';
     this._selectedCameraEntityId = null;
     this._motionPriority = true;
+    this._autoCycleEnabled = false;
+    this._autoCyclePaused = false;
+    this._autoCycleScope = 'all';
+    this._autoCycleInterval = 8;
+    this._autoCycleEntityId = null;
+    this._autoCycleTimer = null;
     this._motionRefreshTimer = null;
     this._escapeHandler = (event) => {
       if (event.key === 'Escape') {
-        if (this.shadowRoot.querySelector('.fullscreen')) {
+        const fullscreen = this.shadowRoot.querySelector('.fullscreen');
+        if (fullscreen?.classList.contains('auto-cycle')) {
+          this._pauseAutoCycle();
+          return;
+        }
+
+        if (fullscreen) {
           this._closeFullscreen();
           return;
         }
@@ -42,6 +54,7 @@ class CctvAppPanel extends HTMLElement {
       window.clearInterval(this._motionRefreshTimer);
       this._motionRefreshTimer = null;
     }
+    this._clearAutoCycleTimer();
   }
 
   _renderIfNeeded(force = false) {
@@ -52,7 +65,12 @@ class CctvAppPanel extends HTMLElement {
       this._detailMode,
       this._selectedCameraEntityId || '',
       this._motionPriority,
-      cameras.map((camera) => `${camera.entityId}:${camera.name}:${camera.hasMotion}:${camera.motionSensorId}:${camera.motionLastChanged}`).join('|'),
+      this._autoCycleEnabled,
+      this._autoCyclePaused,
+      this._autoCycleScope,
+      this._autoCycleInterval,
+      this._autoCycleEntityId || '',
+      cameras.map((camera) => `${camera.entityId}:${camera.name}:${camera.status}:${camera.isOnline}:${camera.hasMotion}:${camera.motionSensorId}:${camera.motionLastChanged}`).join('|'),
       selectedEntities.map((entity) => `${entity.entityId}:${entity.state.state}:${entity.name}`).join('|'),
     ].join('::');
 
@@ -77,6 +95,8 @@ class CctvAppPanel extends HTMLElement {
           entityId,
           name: state.attributes?.friendly_name || entityId,
           deviceId: this._deviceIdForEntity(entityId, state),
+          status: state.state,
+          isOnline: this._isOnlineCameraState(state),
           hasMotion: Boolean(relatedMotion),
           motionSensorId: relatedMotion?.entityId || '',
           motionLastChanged: relatedMotion?.lastChanged || '',
@@ -216,6 +236,138 @@ class CctvAppPanel extends HTMLElement {
     return `/api/camera_proxy/${encodeURIComponent(entityId)}`;
   }
 
+  _isOnlineCameraState(state) {
+    return Boolean(state) && !['unavailable', 'unknown'].includes(String(state.state).toLowerCase());
+  }
+
+  _getCycleCameras(cameras = this._getCameras()) {
+    return cameras.filter((camera) => camera.isOnline && (this._autoCycleScope === 'all' || camera.hasMotion));
+  }
+
+  _currentCycleCamera(cameras = this._getCameras()) {
+    const cycleCameras = this._getCycleCameras(cameras);
+    return cycleCameras.find((camera) => camera.entityId === this._autoCycleEntityId) || cycleCameras[0] || null;
+  }
+
+  _startAutoCycle() {
+    const camera = this._currentCycleCamera();
+    if (!camera) {
+      return;
+    }
+
+    this._autoCycleEnabled = true;
+    this._autoCyclePaused = false;
+    this._autoCycleEntityId = camera.entityId;
+    this._renderIfNeeded(true);
+    this._scheduleAutoCycle();
+  }
+
+  _resumeAutoCycle() {
+    if (!this._autoCycleEnabled) {
+      this._startAutoCycle();
+      return;
+    }
+
+    const camera = this._currentCycleCamera();
+    if (!camera) {
+      this._stopAutoCycle();
+      return;
+    }
+
+    this._autoCyclePaused = false;
+    this._autoCycleEntityId = camera.entityId;
+    this._renderIfNeeded(true);
+    this._scheduleAutoCycle();
+  }
+
+  _pauseAutoCycle() {
+    if (!this._autoCycleEnabled || this._autoCyclePaused) {
+      return;
+    }
+
+    this._autoCyclePaused = true;
+    this._clearAutoCycleTimer();
+    this._renderIfNeeded(true);
+  }
+
+  _stopAutoCycle() {
+    this._autoCycleEnabled = false;
+    this._autoCyclePaused = false;
+    this._autoCycleEntityId = null;
+    this._clearAutoCycleTimer();
+    this._closeFullscreenElementOnly();
+    this._renderIfNeeded(true);
+  }
+
+  _advanceAutoCycle() {
+    if (!this._autoCycleEnabled || this._autoCyclePaused) {
+      return;
+    }
+
+    const cameras = this._getCycleCameras();
+    if (!cameras.length) {
+      this._stopAutoCycle();
+      return;
+    }
+
+    const currentIndex = Math.max(0, cameras.findIndex((camera) => camera.entityId === this._autoCycleEntityId));
+    this._autoCycleEntityId = cameras[(currentIndex + 1) % cameras.length].entityId;
+    this._renderIfNeeded(true);
+    this._scheduleAutoCycle();
+  }
+
+  _scheduleAutoCycle() {
+    this._clearAutoCycleTimer();
+    if (!this._autoCycleEnabled || this._autoCyclePaused) {
+      return;
+    }
+
+    this._autoCycleTimer = window.setTimeout(() => this._advanceAutoCycle(), this._autoCycleInterval * 1000);
+  }
+
+  _clearAutoCycleTimer() {
+    if (this._autoCycleTimer) {
+      window.clearTimeout(this._autoCycleTimer);
+      this._autoCycleTimer = null;
+    }
+  }
+
+  _setAutoCycleInterval(value) {
+    const nextInterval = Math.min(15, Math.max(5, Number(value) || 8));
+    if (this._autoCycleInterval === nextInterval) {
+      return;
+    }
+
+    this._autoCycleInterval = nextInterval;
+    this._renderIfNeeded(true);
+    this._scheduleAutoCycle();
+  }
+
+  _setAutoCycleScope(scope) {
+    if (!['all', 'motion'].includes(scope) || this._autoCycleScope === scope) {
+      return;
+    }
+
+    this._autoCycleScope = scope;
+    const camera = this._currentCycleCamera();
+    this._autoCycleEntityId = camera?.entityId || null;
+    if (this._autoCycleEnabled && !camera) {
+      this._autoCyclePaused = true;
+      this._clearAutoCycleTimer();
+    }
+
+    this._renderIfNeeded(true);
+    this._scheduleAutoCycle();
+  }
+
+  _handleAutoCycleInteraction(event) {
+    if (event.target.closest('.auto-cycle-control')) {
+      return;
+    }
+
+    this._pauseAutoCycle();
+  }
+
   _openCameraDetail(entityId, mode = 'fullscreen') {
     const camera = this._getCameras().find((item) => item.entityId === entityId);
     if (!camera) {
@@ -287,11 +439,12 @@ class CctvAppPanel extends HTMLElement {
 
     if (this._view === 'detail' && selectedCamera) {
       this._renderDetail(cameras, selectedCamera);
-      return;
+    } else {
+      this._view = 'grid';
+      this._renderGridPage(cameras);
     }
 
-    this._view = 'grid';
-    this._renderGridPage(cameras);
+    this._renderAutoCycleOverlay(cameras);
   }
 
   _styles() {
@@ -378,6 +531,58 @@ class CctvAppPanel extends HTMLElement {
           flex-wrap: wrap;
         }
 
+        .cycle-panel {
+          display: grid;
+          grid-template-columns: minmax(14rem, 1fr) auto auto;
+          align-items: center;
+          gap: 0.75rem;
+          width: 100%;
+          margin-bottom: 1.25rem;
+          padding: 0.9rem;
+          border: 1px solid rgba(87, 222, 255, 0.18);
+          border-radius: 18px;
+          background: linear-gradient(135deg, rgba(0, 229, 255, 0.08), rgba(9, 18, 32, 0.68));
+          box-shadow: 0 0 28px rgba(0, 229, 255, 0.07);
+        }
+
+        .cycle-status {
+          display: grid;
+          gap: 0.2rem;
+          min-width: 0;
+        }
+
+        .cycle-title {
+          color: #e8fbff;
+          font-size: 0.95rem;
+          font-weight: 900;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+        }
+
+        .cycle-meta {
+          color: #8fbac4;
+          font-size: 0.8rem;
+          font-weight: 700;
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+        }
+
+        .cycle-range {
+          display: flex;
+          align-items: center;
+          gap: 0.65rem;
+          color: #8fbac4;
+          font-size: 0.78rem;
+          font-weight: 800;
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+        }
+
+        .cycle-range input {
+          width: min(16rem, 28vw);
+          accent-color: #00e5ff;
+        }
+
         .toggle,
         .detail-tabs {
           display: inline-flex;
@@ -391,6 +596,8 @@ class CctvAppPanel extends HTMLElement {
 
         .toggle button,
         .detail-tabs button,
+        .cycle-button,
+        .cycle-button,
         .back,
         .close,
         .control-action,
@@ -408,12 +615,14 @@ class CctvAppPanel extends HTMLElement {
         }
 
         .toggle button[aria-pressed="true"],
-        .detail-tabs button[aria-pressed="true"] {
+        .detail-tabs button[aria-pressed="true"],
+        .cycle-button[aria-pressed="true"] {
           color: #e8fbff;
           background: rgba(0, 229, 255, 0.14);
           box-shadow: inset 0 0 0 1px rgba(105, 241, 255, 0.28), 0 0 22px rgba(0, 229, 255, 0.12);
         }
 
+        .cycle-button,
         .back,
         .close,
         .control-action,
@@ -427,6 +636,8 @@ class CctvAppPanel extends HTMLElement {
         .toggle button:focus-visible,
         .detail-tabs button:hover,
         .detail-tabs button:focus-visible,
+        .cycle-button:hover,
+        .cycle-button:focus-visible,
         .back:hover,
         .back:focus-visible,
         .close:hover,
@@ -451,8 +662,31 @@ class CctvAppPanel extends HTMLElement {
 
         .grid {
           display: grid;
+          gap: clamp(0.7rem, 1.4vw, 1.25rem);
+        }
+
+        .grid.scale-few {
+          grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr));
+        }
+
+        .grid.scale-balanced {
           grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-          gap: clamp(0.85rem, 1.7vw, 1.25rem);
+        }
+
+        .grid.scale-wall {
+          grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        }
+
+        .grid.scale-wall .name {
+          padding: 0.65rem 0.75rem 0.8rem;
+          font-size: 0.85rem;
+        }
+
+        .grid.scale-wall .motion-badge {
+          top: 0.45rem;
+          left: 0.45rem;
+          padding: 0.24rem 0.42rem;
+          font-size: 0.62rem;
         }
 
         .card,
@@ -727,6 +961,40 @@ class CctvAppPanel extends HTMLElement {
           white-space: nowrap;
         }
 
+        .fullscreen-actions {
+          display: flex;
+          align-items: center;
+          gap: 0.6rem;
+          flex-wrap: wrap;
+          justify-content: flex-end;
+        }
+
+        .fullscreen-subtitle {
+          margin-top: 0.2rem;
+          color: #8fbac4;
+          font-size: 0.78rem;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+        }
+
+        .fullscreen.auto-cycle-paused .fullscreen-frame img {
+          filter: saturate(0.72) brightness(0.82);
+        }
+
+        .pause-ribbon {
+          position: absolute;
+          z-index: 2;
+          border: 1px solid rgba(255, 211, 94, 0.45);
+          border-radius: 999px;
+          padding: 0.6rem 0.9rem;
+          color: #fff4c2;
+          background: rgba(84, 60, 0, 0.58);
+          box-shadow: 0 0 28px rgba(255, 211, 94, 0.15);
+          font-weight: 900;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+        }
+
         .fullscreen-frame {
           display: grid;
           min-height: 0;
@@ -751,12 +1019,107 @@ class CctvAppPanel extends HTMLElement {
             flex-direction: column;
           }
 
+          .cycle-panel {
+            grid-template-columns: 1fr;
+          }
+
+          .cycle-range input {
+            width: 100%;
+          }
+
           .control-grid {
             grid-template-columns: 1fr;
           }
         }
       </style>
     `;
+  }
+
+  _gridScaleClass(count) {
+    if (count <= 4) {
+      return 'scale-few';
+    }
+
+    if (count >= 10) {
+      return 'scale-wall';
+    }
+
+    return 'scale-balanced';
+  }
+
+  _renderAutoCycleControls(cameras) {
+    const onlineCount = cameras.filter((camera) => camera.isOnline).length;
+    const eligibleCount = this._getCycleCameras(cameras).length;
+    const motionEligibleCount = cameras.filter((camera) => camera.isOnline && camera.hasMotion).length;
+    const stateText = this._autoCycleEnabled ? (this._autoCyclePaused ? 'Paused' : 'Cycling') : 'Ready';
+    const currentCamera = this._currentCycleCamera(cameras);
+
+    return `
+      <section class="cycle-panel" aria-label="Auto-cycle mode">
+        <div class="cycle-status">
+          <div class="cycle-title">Auto-Cycle Mode · ${stateText}</div>
+          <div class="cycle-meta">${eligibleCount} eligible · ${onlineCount} online · ${motionEligibleCount} motion · ${currentCamera ? this._escapeText(currentCamera.name) : 'No camera queued'}</div>
+        </div>
+        <div class="toggle" role="group" aria-label="Auto-cycle camera scope">
+          <button type="button" class="cycle-button cycle-scope" data-cycle-scope="all" aria-pressed="${this._autoCycleScope === 'all'}">All Cameras</button>
+          <button type="button" class="cycle-button cycle-scope" data-cycle-scope="motion" aria-pressed="${this._autoCycleScope === 'motion'}">Motion Only</button>
+        </div>
+        <label class="cycle-range">
+          <span>${this._autoCycleInterval}s</span>
+          <input class="cycle-interval" type="range" min="5" max="15" step="1" value="${this._autoCycleInterval}" aria-label="Auto-cycle interval seconds">
+        </label>
+        <div class="fullscreen-actions">
+          ${!this._autoCycleEnabled ? '<button type="button" class="cycle-button cycle-start">Start Cycle</button>' : ''}
+          ${this._autoCycleEnabled && !this._autoCyclePaused ? '<button type="button" class="cycle-button cycle-pause">Pause</button>' : ''}
+          ${this._autoCycleEnabled && this._autoCyclePaused ? '<button type="button" class="cycle-button cycle-resume">Resume</button>' : ''}
+          ${this._autoCycleEnabled ? '<button type="button" class="cycle-button cycle-stop">Stop</button>' : ''}
+        </div>
+      </section>
+    `;
+  }
+
+  _renderAutoCycleOverlay(cameras) {
+    if (!this._autoCycleEnabled) {
+      return;
+    }
+
+    const camera = this._currentCycleCamera(cameras);
+    if (!camera) {
+      this._autoCyclePaused = true;
+      this._clearAutoCycleTimer();
+      return;
+    }
+
+    this._autoCycleEntityId = camera.entityId;
+    this._closeFullscreenElementOnly();
+
+    const overlay = document.createElement('section');
+    overlay.className = `fullscreen auto-cycle${this._autoCyclePaused ? ' auto-cycle-paused' : ''}`;
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.innerHTML = `
+      <div class="fullscreen-bar">
+        <div>
+          <div class="fullscreen-title">Auto-Cycle · ${this._escapeText(camera.name)}</div>
+          <div class="fullscreen-subtitle">${this._autoCyclePaused ? 'Paused by interaction' : `Next camera in ${this._autoCycleInterval}s`} · ${this._autoCycleScope === 'motion' ? 'Motion-only cameras' : 'All online cameras'}</div>
+        </div>
+        <div class="fullscreen-actions auto-cycle-control">
+          ${this._autoCyclePaused ? '<button class="close cycle-resume" type="button">Resume</button>' : '<button class="close cycle-pause" type="button">Pause</button>'}
+          <button class="close cycle-stop" type="button" aria-label="Stop auto-cycle mode">Stop</button>
+        </div>
+      </div>
+      <div class="fullscreen-frame">
+        ${this._autoCyclePaused ? '<div class="pause-ribbon">Cycling Paused</div>' : ''}
+        <img src="${this._cameraUrl(camera.entityId)}" alt="${this._escapeText(camera.name)} auto-cycle live camera feed">
+      </div>
+    `;
+
+    overlay.addEventListener('pointerdown', (event) => this._handleAutoCycleInteraction(event));
+    overlay.addEventListener('keydown', (event) => this._handleAutoCycleInteraction(event));
+    overlay.querySelector('.cycle-pause')?.addEventListener('click', () => this._pauseAutoCycle());
+    overlay.querySelector('.cycle-resume')?.addEventListener('click', () => this._resumeAutoCycle());
+    overlay.querySelector('.cycle-stop')?.addEventListener('click', () => this._stopAutoCycle());
+    this.shadowRoot.appendChild(overlay);
   }
 
   _renderGridPage(cameras) {
@@ -778,6 +1141,8 @@ class CctvAppPanel extends HTMLElement {
           <div class="motion-summary">${motionCount} recent motion event${motionCount === 1 ? '' : 's'}</div>
         </section>
 
+        ${this._renderAutoCycleControls(cameras)}
+
         ${cameras.length ? this._renderCameraGrid(cameras) : this._renderEmpty()}
       </main>
     `;
@@ -785,6 +1150,15 @@ class CctvAppPanel extends HTMLElement {
     this.shadowRoot.querySelectorAll('.mode-button').forEach((button) => {
       button.addEventListener('click', () => this._setMotionPriority(button.dataset.mode === 'motion'));
     });
+
+    this.shadowRoot.querySelectorAll('.cycle-scope').forEach((button) => {
+      button.addEventListener('click', () => this._setAutoCycleScope(button.dataset.cycleScope));
+    });
+    this.shadowRoot.querySelector('.cycle-start')?.addEventListener('click', () => this._startAutoCycle());
+    this.shadowRoot.querySelector('.cycle-resume')?.addEventListener('click', () => this._resumeAutoCycle());
+    this.shadowRoot.querySelector('.cycle-pause')?.addEventListener('click', () => this._pauseAutoCycle());
+    this.shadowRoot.querySelector('.cycle-stop')?.addEventListener('click', () => this._stopAutoCycle());
+    this.shadowRoot.querySelector('.cycle-interval')?.addEventListener('input', (event) => this._setAutoCycleInterval(event.target.value));
 
     this.shadowRoot.querySelectorAll('.card').forEach((card) => {
       card.addEventListener('click', () => this._openCameraDetail(card.dataset.entityId));
@@ -799,7 +1173,7 @@ class CctvAppPanel extends HTMLElement {
 
   _renderCameraGrid(cameras) {
     return `
-      <section class="grid" aria-label="Camera feeds">
+      <section class="grid ${this._gridScaleClass(cameras.length)}" aria-label="Camera feeds">
         ${cameras
           .map(
             (camera) => `
