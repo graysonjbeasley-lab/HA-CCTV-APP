@@ -463,6 +463,18 @@ class CctvAppPanel extends HTMLElement {
           box-sizing: border-box;
         }
 
+        :host::before {
+          content: '';
+          position: fixed;
+          inset: 0;
+          z-index: 2;
+          pointer-events: none;
+          background:
+            linear-gradient(90deg, transparent, rgba(112, 238, 255, 0.03), transparent),
+            repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.018) 0 1px, transparent 1px 7px);
+          mix-blend-mode: screen;
+        }
+
         * {
           box-sizing: border-box;
         }
@@ -472,9 +484,24 @@ class CctvAppPanel extends HTMLElement {
         }
 
         .shell {
+          position: relative;
+          z-index: 1;
           width: min(1800px, 100%);
           margin: 0 auto;
           padding: clamp(1rem, 2.5vw, 2rem);
+          animation: view-enter 180ms ease-out both;
+        }
+
+        @keyframes view-enter {
+          from {
+            opacity: 0;
+            transform: translateY(8px);
+          }
+
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
         }
 
         .header,
@@ -597,7 +624,6 @@ class CctvAppPanel extends HTMLElement {
         .toggle button,
         .detail-tabs button,
         .cycle-button,
-        .cycle-button,
         .back,
         .close,
         .control-action,
@@ -711,6 +737,21 @@ class CctvAppPanel extends HTMLElement {
           animation: motion-pulse 1.8s ease-in-out infinite;
         }
 
+        .card.active {
+          border-color: rgba(0, 229, 255, 0.9);
+          box-shadow: 0 18px 62px rgba(0, 0, 0, 0.44), 0 0 36px rgba(0, 229, 255, 0.26);
+        }
+
+        .card.active::before {
+          content: '';
+          position: absolute;
+          inset: 0;
+          z-index: 1;
+          pointer-events: none;
+          border-radius: inherit;
+          box-shadow: inset 0 0 0 1px rgba(215, 252, 255, 0.32), inset 0 0 28px rgba(0, 229, 255, 0.08);
+        }
+
         .card:hover,
         .card:focus-visible {
           border-color: rgba(105, 241, 255, 0.48);
@@ -746,11 +787,33 @@ class CctvAppPanel extends HTMLElement {
           aspect-ratio: 16 / 9;
         }
 
+        .frame::before,
+        .detail-feed::before {
+          content: '';
+          position: absolute;
+          inset: 0;
+          pointer-events: none;
+          background: linear-gradient(110deg, transparent 25%, rgba(118, 242, 255, 0.1) 45%, transparent 65%);
+          transform: translateX(-100%);
+          animation: camera-shimmer 2.8s ease-in-out infinite;
+        }
+
+        @keyframes camera-shimmer {
+          0%, 55% {
+            transform: translateX(-100%);
+          }
+
+          100% {
+            transform: translateX(100%);
+          }
+        }
+
         .frame::after,
         .detail-feed::after {
           content: '';
           position: absolute;
           inset: 0;
+          z-index: 1;
           pointer-events: none;
           background:
             linear-gradient(180deg, transparent 68%, rgba(0, 0, 0, 0.36)),
@@ -785,13 +848,72 @@ class CctvAppPanel extends HTMLElement {
           border-radius: 50%;
           background: #ff3d3d;
           box-shadow: 0 0 12px rgba(255, 61, 61, 0.9);
+          animation: motion-dot-pulse 1.2s ease-in-out infinite;
+        }
+
+        @keyframes motion-dot-pulse {
+          0%, 100% {
+            transform: scale(1);
+            opacity: 0.72;
+          }
+
+          50% {
+            transform: scale(1.24);
+            opacity: 1;
+          }
+        }
+
+        .status-pill {
+          position: absolute;
+          right: 0.75rem;
+          top: 0.75rem;
+          z-index: 2;
+          display: inline-flex;
+          align-items: center;
+          gap: 0.35rem;
+          border: 1px solid rgba(143, 186, 196, 0.28);
+          border-radius: 999px;
+          padding: 0.32rem 0.52rem;
+          color: #d9f9ff;
+          background: rgba(3, 6, 12, 0.6);
+          font-size: 0.68rem;
+          font-weight: 900;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          backdrop-filter: blur(8px);
+        }
+
+        .status-pill::before,
+        .status-light {
+          content: '';
+          width: 0.5rem;
+          height: 0.5rem;
+          border-radius: 50%;
+          background: #5effb1;
+          box-shadow: 0 0 12px rgba(94, 255, 177, 0.75);
+        }
+
+        .status-pill.offline::before,
+        .status-light.offline {
+          background: #ff5e73;
+          box-shadow: 0 0 12px rgba(255, 94, 115, 0.72);
         }
 
         img {
+          position: relative;
+          z-index: 0;
           display: block;
           width: 100%;
           height: 100%;
           object-fit: cover;
+          opacity: 0;
+          animation: feed-reveal 220ms ease-out 90ms forwards;
+        }
+
+        @keyframes feed-reveal {
+          to {
+            opacity: 1;
+          }
         }
 
         .name {
@@ -804,6 +926,23 @@ class CctvAppPanel extends HTMLElement {
           font-size: 0.98rem;
           font-weight: 700;
           letter-spacing: 0.02em;
+        }
+
+        .name-meta {
+          display: inline-flex;
+          align-items: center;
+          gap: 0.5rem;
+          min-width: 0;
+        }
+
+        .name-meta span:first-child {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .status-light {
+          flex: 0 0 auto;
         }
 
         .empty {
@@ -1011,6 +1150,22 @@ class CctvAppPanel extends HTMLElement {
           box-shadow: 0 0 45px rgba(0, 229, 255, 0.12);
         }
 
+        @media (prefers-reduced-motion: reduce) {
+          .shell,
+          .card.motion,
+          .motion-dot,
+          .motion-badge::before,
+          .frame::before,
+          .detail-feed::before,
+          img {
+            animation: none;
+          }
+
+          img {
+            opacity: 1;
+          }
+        }
+
         @media (max-width: 900px) {
           .header,
           .detail-topbar,
@@ -1176,18 +1331,24 @@ class CctvAppPanel extends HTMLElement {
       <section class="grid ${this._gridScaleClass(cameras.length)}" aria-label="Camera feeds">
         ${cameras
           .map(
-            (camera) => `
-              <article class="card${camera.hasMotion ? ' motion' : ''}" tabindex="0" role="button" aria-label="Open ${this._escapeText(camera.name)} detail dashboard" data-entity-id="${this._escapeText(camera.entityId)}">
-                <div class="frame">
-                  ${camera.hasMotion ? '<span class="motion-badge">Motion</span>' : ''}
-                  <img loading="lazy" decoding="async" src="${this._cameraUrl(camera.entityId)}" alt="${this._escapeText(camera.name)} live camera feed">
-                </div>
-                <div class="name">
-                  <span>${this._escapeText(camera.name)}</span>
-                  ${camera.hasMotion ? '<span class="motion-dot" aria-label="Recent motion detected"></span>' : ''}
-                </div>
-              </article>
-            `,
+            (camera) => {
+              const isActive = camera.entityId === this._selectedCameraEntityId || camera.entityId === this._autoCycleEntityId;
+              const statusText = camera.isOnline ? 'Online' : 'Offline';
+
+              return `
+                <article class="card${camera.hasMotion ? ' motion' : ''}${isActive ? ' active' : ''}" tabindex="0" role="button" aria-label="Open ${this._escapeText(camera.name)} detail dashboard" data-entity-id="${this._escapeText(camera.entityId)}">
+                  <div class="frame">
+                    ${camera.hasMotion ? '<span class="motion-badge">Motion</span>' : ''}
+                    <span class="status-pill${camera.isOnline ? '' : ' offline'}">${statusText}</span>
+                    <img loading="lazy" decoding="async" src="${this._cameraUrl(camera.entityId)}" alt="${this._escapeText(camera.name)} live camera feed">
+                  </div>
+                  <div class="name">
+                    <span class="name-meta"><span>${this._escapeText(camera.name)}</span><span class="status-light${camera.isOnline ? '' : ' offline'}" aria-label="${statusText}"></span></span>
+                    ${camera.hasMotion ? '<span class="motion-dot" aria-label="Recent motion detected"></span>' : ''}
+                  </div>
+                </article>
+              `;
+            },
           )
           .join('')}
       </section>
@@ -1235,7 +1396,7 @@ class CctvAppPanel extends HTMLElement {
         <div class="feed-hud">
           <div>
             <div class="entity-name">Live tactical feed</div>
-            <div class="entity-id">${this._escapeText(camera.entityId)}</div>
+            <div class="entity-id"><span class="status-light${camera.isOnline ? '' : ' offline'}"></span>${camera.isOnline ? 'Online' : 'Offline'} · ${this._escapeText(camera.entityId)}</div>
           </div>
           <button class="fullscreen-action" type="button">Open Immersive</button>
         </div>
